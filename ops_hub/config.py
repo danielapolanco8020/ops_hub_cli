@@ -107,7 +107,7 @@ UNWANTED_NAMES = [
     "City of", "Not Provided Name"
 ]
 
-UNWANTED_OWNER_TYPES = ["Non Sellers", "Religious Organization"]
+UNWANTED_OWNER_TYPES = []
 
 TAGS_BLACKLIST = [
     "Liti", "DNC", "donotmail", "Takeoff", "Undeli", "Return", "Dead",
