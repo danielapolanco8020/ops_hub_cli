@@ -22,6 +22,69 @@ def _check(label: str, passed: bool, detail: str = ""):
     print(line)
 
 
+def _resolve_audit_files(input_dir: Path) -> list[Path]:
+    """
+    For each file found, check if a split version exists in step2.
+    If so, ask the user whether to use the split file or the original.
+    Always looks for originals in step1_clean and splits in step2_optional.
+    """
+    from config import OUT_STEP1, OUT_STEP2
+    from utils.file_helpers import get_excel_files
+
+    originals   = get_excel_files(OUT_STEP1)
+    split_files = [f for f in get_excel_files(OUT_STEP2) if f.name.startswith("split_")]
+
+    # If no split files exist just use whatever is in input_dir
+    if not split_files:
+        return get_excel_files(input_dir)
+
+    selected = []
+    matched_splits = set()
+
+    for orig in originals:
+        # Strip "cleaned_" prefix to match against split filename
+        stem   = orig.stem.replace("cleaned_", "")
+        splits = [s for s in split_files if stem.lower() in s.name.lower()]
+
+        if splits:
+            print(f"\n  Split file(s) found for: {orig.name}")
+            for i, s in enumerate(splits, 1):
+                print(f"    {i}. {s.name}  (split)")
+            print(f"    {len(splits)+1}. {orig.name}  (original — step1_clean)")
+            while True:
+                try:
+                    idx = int(input("  Which file to audit? ").strip()) - 1
+                    if 0 <= idx < len(splits):
+                        selected.append(splits[idx])
+                        matched_splits.add(splits[idx])
+                        break
+                    elif idx == len(splits):
+                        selected.append(orig)
+                        break
+                    print(f"  Enter a number between 1 and {len(splits)+1}.")
+                except ValueError:
+                    print("  Enter a valid number.")
+        else:
+            selected.append(orig)
+
+    # Include any split files not matched to any original
+    unmatched = [s for s in split_files if s not in matched_splits]
+    for s in unmatched:
+        print(f"\n  Unmatched split file found: {s.name}")
+        if prompt_yes_no(f"  Include in audit?", default=True):
+            selected.append(s)
+
+    return selected
+
+
+
+    status = "PASS" if passed else "FAIL"
+    line   = f"  [{status}] {label}"
+    if detail:
+        line += f"  → {detail}"
+    print(line)
+
+
 def _audit_file(df: pd.DataFrame, file_path: Path):
     print(f"\n  File : {file_path.name}")
     print(f"  Rows : {len(df):,}")
@@ -103,8 +166,18 @@ def _audit_file(df: pd.DataFrame, file_path: Path):
     is_sms = "sms" in fname_lower
 
     if is_cc or is_sms:
-        phone_type_cols = [c for c in df.columns if c.upper().startswith("PHONE TYPE")]
-        phone_num_cols  = [c for c in df.columns if c.upper().startswith("PHONE NUMBER")]
+        phone_type_cols = sorted(
+            [c for c in df.columns if re.match(r'PHONE TYPE\s*\d+', c, re.IGNORECASE)],
+            key=lambda x: int(re.search(r'\d+', x).group())
+        )
+        phone_num_cols  = sorted(
+            [c for c in df.columns if re.match(r'PHONE NUMBER\s*\d+', c, re.IGNORECASE)],
+            key=lambda x: int(re.search(r'\d+', x).group())
+        )
+
+        # Cap to only columns that have at least one non-null value
+        phone_type_cols = [c for c in phone_type_cols if df[c].notna().any()]
+        phone_num_cols  = [c for c in phone_num_cols  if df[c].notna().any()]
         all_phone_cols  = phone_type_cols + phone_num_cols
         keywords        = "void|null|failed" + ("|landline" if is_sms else "")
 
@@ -116,28 +189,12 @@ def _audit_file(df: pd.DataFrame, file_path: Path):
                    f"{len(flagged):,} invalid phone types" if not flagged.empty else "")
 
         if all_phone_cols:
-            # Count BEFORE any string conversion
-            has_phone  = df[all_phone_cols].apply(
-                lambda col: col.replace("", pd.NA).notna()
-            ).any(axis=1)
-            with_phone = int(has_phone.sum())
-            no_phone   = int((~has_phone).sum())
-            total      = len(df)
-
-            print(f"\n  --- PHONE COUNT ---")
-            print(f"  Total properties                       : {total:,}")
-            print(f"  Properties with active phone numbers   : {with_phone:,}")
-            print(f"  Properties without active phone numbers: {no_phone:,}")
-
-            if "TAGS" in df.columns:
-                skip_pattern = re.compile(r'\bskip\b', re.IGNORECASE)
-                no_skip = df[~has_phone & ~df["TAGS"].str.contains(skip_pattern, na=False)]
-                print(f"  Properties without SKIPTRACE tag       : {len(no_skip):,}")
-
-            # ── Goal prompt — reporting only, no rows dropped ──────────────────
+            # ── Goal prompt first ──────────────────────────────────────────────
+            total = len(df)
+            print(f"\n  --- GOAL & PHONE COUNT ---")
+            print(f"  Total properties in file: {total:,}")
             print(f"\n  How many rows do you want to keep from this file?")
-            print(f"  Available with active phones: {with_phone:,}")
-            print(f"  Maximum possible (all rows) : {total:,}")
+
             while True:
                 raw = input(f"  Enter goal (or press Enter for max {total:,}): ").strip()
                 if raw == "":
@@ -151,11 +208,39 @@ def _audit_file(df: pd.DataFrame, file_path: Path):
                 except ValueError:
                     print("  Enter a valid number.")
 
-            if goal > with_phone:
-                shortfall = goal - with_phone
-                print_warn(f"  Goal of {goal:,} set — note that {shortfall:,} rows will not have active phone numbers.")
+            # ── Trim to goal keeping highest scores ────────────────────────────
+            score_cols = [c for c in ["BUYBOX SCORE", "LIKELY DEAL SCORE", "SCORE"] if c in df.columns]
+            if score_cols:
+                for c in score_cols:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+                df = df.sort_values(by=score_cols, ascending=[False] * len(score_cols))
+
+            working_df = df.head(goal).copy()
+            dropped    = total - len(working_df)
+
+            if dropped > 0:
+                print_done(f"  Keeping top {len(working_df):,} rows — {dropped:,} dropped.")
             else:
-                print_done(f"  Goal of {goal:,} rows — all will have active phone numbers.")
+                print_done(f"  Keeping all {len(working_df):,} rows.")
+
+            # ── Phone count on trimmed set ─────────────────────────────────────
+            has_phone  = working_df[all_phone_cols].apply(
+                lambda col: col.replace("", pd.NA).notna()
+            ).any(axis=1)
+            with_phone = int(has_phone.sum())
+            no_phone   = int((~has_phone).sum())
+
+            print(f"\n  Properties with active phone numbers   : {with_phone:,}")
+            print(f"  Properties without active phone numbers: {no_phone:,}")
+
+            if "TAGS" in working_df.columns:
+                skip_pattern = re.compile(r'\bskip\b', re.IGNORECASE)
+                no_skip = working_df[~has_phone & ~working_df["TAGS"].str.contains(skip_pattern, na=False)]
+                print(f"  Properties without SKIPTRACE tag       : {len(no_skip):,}")
+
+            if with_phone < goal:
+                shortfall = goal - with_phone
+                print_warn(f"  {shortfall:,} rows in goal do not have active phone numbers.")
 
 
 def run():
@@ -171,7 +256,7 @@ def run():
         print_error("No processed files found in any output folder.")
         return
 
-    files = get_excel_files(input_dir)
+    files = _resolve_audit_files(input_dir)
     if not files:
         print_error(f"No Excel files found in {input_dir.name}/")
         return

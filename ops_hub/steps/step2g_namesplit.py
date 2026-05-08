@@ -1,10 +1,11 @@
 import pandas as pd
 from pathlib import Path
 
-from config import OUT_STEP1, OUT_STEP2
+from config import OUT_STEP1, OUT_STEP2, CADENCES
 from utils.file_helpers import (
-    get_excel_files, read_excel, save_excel,
-    prompt_yes_no, print_header, print_step, print_done, print_warn, print_error,
+    get_files_by_cadence, read_excel, save_excel,
+    prompt_yes_no,
+    print_header, print_step, print_done, print_warn, print_error,
     make_output_path,
 )
 from utils.name_helpers import clean_and_split_name, needs_name_split
@@ -13,14 +14,23 @@ from utils.name_helpers import clean_and_split_name, needs_name_split
 def run():
     print_header("STEP 2G — NAME CLEANER & SPLITTER")
 
-    input_dir = OUT_STEP2 if list(OUT_STEP2.glob("*.xlsx")) else OUT_STEP1
-    files     = get_excel_files(input_dir)
+    # Collect files per cadence across both folders
+    all_files = []
+    for cadence in CADENCES:
+        for folder in [OUT_STEP2, OUT_STEP1]:
+            found = get_files_by_cadence(folder, cadence)
+            if found:
+                all_files.extend(found)
+                break
+
+    # Deduplicate by filename
+    files = list({f.name: f for f in all_files}.values())
 
     if not files:
-        print_error(f"No Excel files found in {input_dir.name}/")
+        print_error("No processed files found in any output folder.")
         return
 
-    print_step(f"Found {len(files)} file(s) in {input_dir.name}/")
+    print_step(f"Found {len(files)} file(s)")
 
     for f in files:
         print_step(f"Processing: {f.name}")

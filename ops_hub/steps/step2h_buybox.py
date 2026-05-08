@@ -6,9 +6,8 @@ from config import (
     BUYBOX_LOW_RATE, BUYBOX_HIGH_RATE, BUYBOX_OFFER_RATE, BUYBOX_LOW_LIMIT,
 )
 from utils.file_helpers import (
-    get_excel_files, read_excel, save_excel_multisheet,
+    get_excel_files, get_files_by_cadence, read_excel, save_excel_multisheet,
     prompt_file_selection, prompt_yes_no, prompt_float, prompt_int,
-    resolve_input_dir,
     print_header, print_step, print_done, print_warn, print_error,
     make_output_path,
 )
@@ -98,11 +97,33 @@ def _process(
 def run():
     print_header("STEP 2H — BUYBOX HQ")
 
-    input_dir = resolve_input_dir([OUT_STEP2, OUT_STEP1])
-    if not input_dir:
+    # Collect files per cadence across both folders
+    from config import CADENCES
+    all_files = []
+    for cadence in CADENCES:
+        for folder in [OUT_STEP2, OUT_STEP1]:
+            found = get_files_by_cadence(folder, cadence)
+            if found:
+                all_files.extend(found)
+                break
+    all_files = list({f.name: f for f in all_files}.values())
+
+    if not all_files:
         print_error("No processed files found in any output folder.")
         return
-    f = prompt_file_selection(input_dir, "file to process")
+
+    print("\n  Available files:")
+    for i, file in enumerate(all_files, 1):
+        print(f"    {i}. {file.name}  ({file.parent.name}/)")
+    while True:
+        try:
+            idx = int(input("  Select file to process: ").strip()) - 1
+            if 0 <= idx < len(all_files):
+                f = all_files[idx]
+                break
+            print(f"  Enter a number between 1 and {len(all_files)}.")
+        except ValueError:
+            print("  Enter a valid number.")
     if f is None:
         return
 

@@ -3,7 +3,7 @@ from pathlib import Path
 
 from config import OUT_STEP3, OUT_STEP2, OUT_STEP1, OUT_STEP4, SKIPTRACE_EXPORT_COLUMNS
 from utils.file_helpers import (
-    get_files_by_cadence, get_excel_files, read_excel, save_excel,
+    get_files_by_cadence, read_excel, save_excel,
     make_output_path,
     print_header, print_step, print_done, print_warn, print_error,
 )
@@ -15,6 +15,7 @@ DEDUP_COLS = ["FOLIO", "ADDRESS", "ZIP"]
 def run():
     print_header("STEP 4 — SKIPTRACE PRE-EXPORT")
 
+    # Cadence selection — CC and SMS only
     print("\n  Select cadence to export for skiptrace:")
     print("    1. Cold Calling")
     print("    2. SMS")
@@ -33,24 +34,23 @@ def run():
         else:
             print("  Enter 1, 2 or 3.")
 
-    # Resolve input directory — walk back through pipeline outputs
-    if list(OUT_STEP3.glob("*.xlsx")):
-        input_dir = OUT_STEP3
-    elif list(OUT_STEP2.glob("*.xlsx")):
-        input_dir = OUT_STEP2
-    else:
-        input_dir = OUT_STEP1
-
-    print_step(f"Reading from: {input_dir.name}/")
-
     source_cols  = list(SKIPTRACE_EXPORT_COLUMNS.keys())
     all_frames: list[pd.DataFrame] = []
 
     for cadence in cadences:
-        files = get_files_by_cadence(input_dir, cadence)
-        if not files:
-            print_warn(f"  No files found for cadence '{cadence}' in {input_dir.name}/")
+        # Resolve per cadence
+        input_dir = None
+        for folder in [OUT_STEP3, OUT_STEP2, OUT_STEP1]:
+            if get_files_by_cadence(folder, cadence):
+                input_dir = folder
+                break
+
+        if not input_dir:
+            print_warn(f"  No files found for cadence '{cadence}' in any output folder.")
             continue
+
+        files = get_files_by_cadence(input_dir, cadence)
+        print_step(f"Found {len(files)} {cadence} file(s) in {input_dir.name}/")
 
         for f in files:
             print_step(f"Reading: {f.name}  [{cadence}]")
@@ -91,6 +91,6 @@ def run():
     print_done(f"Export saved → {out_path.name}  ({len(merged):,} rows)")
 
     print(f"\n  Next steps:")
-    print(f"  1. Upload '{out_path.name}' from 'output/step4_skiptrace/export/' to your provider")
+    print(f"  1. Upload 'skiptrace_upload.xlsx' from 'output/step4_skiptrace/export/'")
     print(f"  2. Once results come back, place them in 'merge/skiptrace/'")
     print(f"  3. Post-merge functionality can be added in a future step")

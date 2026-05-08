@@ -4,7 +4,7 @@ from pathlib import Path
 from config import OUT_STEP2, OUT_STEP1, DATAFLICK_DEFAULT_CHUNK
 from utils.file_helpers import (
     get_files_by_cadence, read_excel, save_excel,
-    prompt_int, prompt_yes_no, make_output_path, resolve_input_dir,
+    prompt_int, prompt_yes_no, make_output_path,
     print_header, print_step, print_done, print_warn, print_error,
 )
 
@@ -58,12 +58,16 @@ def run():
         "  Enter chunk size", DATAFLICK_DEFAULT_CHUNK, min_val=1000
     )
 
-    input_dir = resolve_input_dir([OUT_STEP2, OUT_STEP1])
-    if not input_dir:
-        print_error("No processed files found in any output folder.")
-        return
-
     for cadence in cadences:
+        # Resolve per cadence
+        input_dir = None
+        for folder in [OUT_STEP2, OUT_STEP1]:
+            if get_files_by_cadence(folder, cadence):
+                input_dir = folder
+                break
+        if not input_dir:
+            print_warn(f"  No {cadence} files found in any output folder.")
+            continue
         files = get_files_by_cadence(input_dir, cadence)
         if not files:
             print_warn(f"  No {cadence} files found in {input_dir.name}/")

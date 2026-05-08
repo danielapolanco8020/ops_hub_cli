@@ -7,7 +7,6 @@ from config import OUT_STEP2, OUT_STEP1, SPLIT_VALID_PLANS, SPLIT_DEFAULT_WEEKS
 from utils.file_helpers import (
     get_files_by_cadence, read_excel, save_excel_multisheet,
     prompt_cadence_or_all, prompt_yes_no, prompt_int,
-    resolve_input_dir,
     print_header, print_step, print_done, print_warn, print_error,
     make_output_path,
 )
@@ -21,65 +20,129 @@ def _validate(df, cols, label):
         raise ValueError(f"{label}: missing columns: {', '.join(missing)}")
 
 
-def _prompt_proportions() -> tuple[float, float]:
-    use_default = prompt_yes_no("  Use default 50/50 split?", default=True)
-    if use_default:
-        return 50.0, 50.0
+def _prompt_proportions() -> list[tuple[str, float]]:
+    """
+    Prompt user for number of templates and their proportions.
+    Returns list of (label, proportion) tuples e.g. [('template_a', 50.0), ('template_b', 30.0), ('template_c', 20.0)]
+    """
     while True:
-        raw = input("  Enter proportions A, B (must sum to 100, e.g. 60,40): ").strip()
         try:
-            a, b = map(float, raw.split(","))
-            if a <= 0 or b <= 0:
-                print("  Both values must be positive.")
-                continue
-            if abs(a + b - 100) > 0.001:
-                print("  Values must sum to 100.")
-                continue
-            return a, b
+            n = int(input("  How many templates do you want to split into? (min 2): ").strip())
+            if n >= 2:
+                break
+            print("  Must be at least 2.")
         except ValueError:
-            print("  Enter two numbers separated by a comma.")
+            print("  Enter a valid number.")
+
+    use_default = n == 2 and prompt_yes_no("  Use default 50/50 split?", default=True)
+    if use_default:
+        return [("template_a", 50.0), ("template_b", 50.0)]
+
+    labels = [f"template_{chr(97+i)}" for i in range(n)]  # template_a, template_b, template_c...
+
+    while True:
+        print(f"  Enter proportions for {n} templates separated by commas (must sum to 100).")
+        print(f"  Example for {n} templates: {', '.join(['33.3']*( n-1) + [str(round(100 - 33.3*(n-1), 1))])}")
+        raw = input("  Proportions: ").strip()
+        try:
+            parts = [float(x.strip()) for x in raw.split(",")]
+            if len(parts) != n:
+                print(f"  Enter exactly {n} values.")
+                continue
+            if any(p <= 0 for p in parts):
+                print("  All values must be positive.")
+                continue
+            if abs(sum(parts) - 100) > 0.01:
+                print(f"  Values must sum to 100. Current sum: {sum(parts)}")
+                continue
+            return list(zip(labels, parts))
+        except ValueError:
+            print("  Enter valid numbers separated by commas.")
 
 
-def _split_balanced(df, prop_a, prop_b, label_a, label_b):
-    total    = len(df)
-    target_a = int(total * prop_a / 100)
-    target_b = total - target_a
+def _split_balanced(df, proportions: list[tuple[str, float]]) -> dict[str, pd.DataFrame]:
+    """
+    Split df into N templates with balanced ACTION PLANS distribution.
+    proportions = [('template_a', 50.0), ('template_b', 30.0), ('template_c', 20.0)]
+    """
+    total      = len(df)
+    n          = len(proportions)
+    labels     = [p[0] for p in proportions]
+    pcts       = [p[1] for p in proportions]
+
+    # Calculate target counts per template
+    targets = [int(total * pct / 100) for pct in pcts]
+    # Distribute rounding remainder to first template
+    targets[0] += total - sum(targets)
 
     plan_counts = df["ACTION PLANS"].value_counts().to_dict()
-    exp_a = {p: int(c * prop_a / 100) for p, c in plan_counts.items()}
-    exp_b = {p: c - exp_a[p] for p, c in plan_counts.items()}
 
-    diff = target_a - sum(exp_a.values())
-    for p, c in sorted(plan_counts.items(), key=lambda x: -x[1]):
-        if diff == 0: break
-        if diff > 0:
-            add = min(diff, c - exp_a[p])
-            exp_a[p] += add; exp_b[p] -= add; diff -= add
-        else:
-            rem = min(-diff, exp_a[p])
-            exp_a[p] -= rem; exp_b[p] += rem; diff += rem
+    # Calculate per-plan counts per template
+    plan_alloc: dict[str, list[int]] = {}
+    for plan, count in plan_counts.items():
+        alloc = [int(count * pct / 100) for pct in pcts]
+        alloc[0] += count - sum(alloc)
+        plan_alloc[plan] = alloc
 
-    out_a, out_b = pd.DataFrame(), pd.DataFrame()
+    # Build output DataFrames
+    outputs = {label: pd.DataFrame() for label in labels}
+    remaining_df = df.copy()
+
     for plan in SPLIT_VALID_PLANS:
-        plan_df = df[df["ACTION PLANS"] == plan]
-        n_a = exp_a.get(plan, 0)
-        n_b = exp_b.get(plan, 0)
-        s_a = plan_df.sample(n=n_a, random_state=42) if n_a > 0 else pd.DataFrame()
-        s_b = plan_df.drop(s_a.index).head(n_b) if n_b > 0 else pd.DataFrame()
-        out_a = pd.concat([out_a, s_a])
-        out_b = pd.concat([out_b, s_b])
+        plan_df = remaining_df[remaining_df["ACTION PLANS"] == plan].copy()
+        if plan_df.empty:
+            continue
+        alloc = plan_alloc.get(plan, [0] * n)
+        for i, label in enumerate(labels):
+            n_rows = alloc[i]
+            if n_rows <= 0:
+                continue
+            sampled = plan_df.sample(n=min(n_rows, len(plan_df)), random_state=42+i)
+            plan_df = plan_df.drop(sampled.index)
+            outputs[label] = pd.concat([outputs[label], sampled])
 
-    return {label_a: out_a.sort_index(), label_b: out_b.sort_index()}
+    return {label: outputs[label].sort_index() for label in labels}
 
 
-# ── Split Modes ────────────────────────────────────────────────────────────────
+def _prompt_goal(df: pd.DataFrame) -> pd.DataFrame:
+    """Ask user for a row goal and trim df to that size keeping highest scores."""
+    total = len(df)
+    print(f"\n  Total rows available: {total:,}")
+    while True:
+        raw = input(f"  Enter goal (or press Enter to use all {total:,} rows): ").strip()
+        if raw == "":
+            return df
+        try:
+            goal = int(raw)
+            if 1 <= goal <= total:
+                break
+            print(f"  Enter a number between 1 and {total:,}.")
+        except ValueError:
+            print("  Enter a valid number.")
+
+    # Trim keeping highest scores
+    score_cols = [c for c in ["BUYBOX SCORE", "LIKELY DEAL SCORE", "SCORE"] if c in df.columns]
+    if score_cols:
+        for c in score_cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df = df.sort_values(by=score_cols, ascending=[False] * len(score_cols))
+
+    trimmed = df.head(goal).copy()
+    dropped = total - len(trimmed)
+    print_done(f"  Goal set to {goal:,} rows — {dropped:,} rows dropped before splitting.")
+    return trimmed
+
+
 
 def _split_1_proportional(df):
     _validate(df, ["FOLIO", "ACTION PLANS", "PROPERTY TYPE"], "Client 1")
     if len(df) < 1000:
         raise ValueError("Need at least 1,000 records.")
-    prop_a, prop_b = _prompt_proportions()
-    return _split_balanced(df, prop_a, prop_b, "template_a", "template_b")
+    proportions = _prompt_proportions()
+    print(f"\n  Splitting into {len(proportions)} templates:")
+    for label, pct in proportions:
+        print(f"    {label}: {pct}%")
+    return _split_balanced(df, proportions)
 
 
 def _split_2_odd_even(df):
@@ -95,12 +158,14 @@ def _split_3_top_x(df):
     _validate(df, ["FOLIO", "ACTION PLANS", "PROPERTY TYPE", "SCORE"], "Client 3")
     if len(df) < 1000:
         raise ValueError("Need at least 1,000 records.")
-    top_x     = prompt_int("  Number of top records to include in both templates", 100, 1, len(df))
-    top_df    = df.nlargest(top_x, "SCORE")
-    remaining = df.drop(top_df.index)
-    splits    = _split_balanced(remaining, 50, 50, "template_a", "template_b")
-    splits["template_a"] = pd.concat([top_df, splits["template_a"]]).sort_index()
-    splits["template_b"] = pd.concat([top_df, splits["template_b"]]).sort_index()
+    top_x       = prompt_int("  Number of top records to include in all templates", 100, 1, len(df))
+    top_df      = df.nlargest(top_x, "SCORE")
+    remaining   = df.drop(top_df.index)
+    proportions = _prompt_proportions()
+    splits      = _split_balanced(remaining, proportions)
+    # Add top_x records to every template
+    for label in splits:
+        splits[label] = pd.concat([top_df, splits[label]]).sort_index()
     return splits
 
 
@@ -209,10 +274,17 @@ def run():
     mode_label, split_fn = MODES[mode_key]
 
     for cadence in cadences:
-        input_dir = resolve_input_dir([OUT_STEP2, OUT_STEP1])
+        # Resolve input dir per cadence
+        input_dir = None
+        for folder in [OUT_STEP2, OUT_STEP1]:
+            if get_files_by_cadence(folder, cadence):
+                input_dir = folder
+                break
+
         if not input_dir:
-            print_warn(f"No processed files found for '{cadence}'")
+            print_warn(f"No files found for cadence '{cadence}' in any output folder.")
             continue
+
         files = get_files_by_cadence(input_dir, cadence)
         if not files:
             print_warn(f"No files found for '{cadence}'")
@@ -224,6 +296,8 @@ def run():
             if df is None:
                 continue
             try:
+                # Ask for goal before splitting
+                df = _prompt_goal(df)
                 sheets = split_fn(df)
                 if not sheets:
                     print_warn(f"  No output produced for {f.name}")
