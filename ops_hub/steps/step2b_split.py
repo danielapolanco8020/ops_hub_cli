@@ -11,7 +11,6 @@ from utils.file_helpers import (
     make_output_path,
 )
 
-
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _validate(df, cols, label):
@@ -296,8 +295,13 @@ def run():
             if df is None:
                 continue
             try:
-                # Ask for goal before splitting
-                df = _prompt_goal(df)
+                # Re-sort by scores to ensure correct order
+                score_cols = [c for c in ["BUYBOX SCORE", "LIKELY DEAL SCORE", "SCORE"] if c in df.columns]
+                if score_cols:
+                    for c in score_cols:
+                        df[c] = pd.to_numeric(df[c], errors="coerce")
+                    df = df.sort_values(by=score_cols, ascending=[False] * len(score_cols))
+
                 sheets = split_fn(df)
                 if not sheets:
                     print_warn(f"  No output produced for {f.name}")
