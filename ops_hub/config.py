@@ -1,3 +1,4 @@
+
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -104,14 +105,73 @@ REQUIRED_COLUMNS = {
 UNWANTED_NAMES = [
     "Given Not", "Record", "Available", "Bank ", "Church ", "School", "Cemetery",
     "Not given", "University", "College", "Owner", "Hospital", "County",
-    "City of", "Not Provided Name"
+    "City of", "Not Provided Name", "Redacted Upon Request"
 ]
 
-UNWANTED_OWNER_TYPES = []
+INSTITUTIONAL_KEYWORDS = [
+    # Banks & financial
+    "Bank", "Bancorp", "Bankers", "Mortgage", "Lending", "Loan", "Financial",
+    "Capital", "Investment", "Investments", "Securities", "Asset", "Assets",
+    "Fund", "Funds", "Credit Union", "Savings",
+    # Government
+    "City of", "County of", "State of", "Department", "Authority",
+    "Commission", "Municipality", "Federal", "Housing Authority",
+    # Religious
+    "Church", "Temple", "Ministry", "Ministries", "Diocese", "Parish",
+    "Cathedral", "Mosque", "Synagogue", "Fellowship", "Assembly of God",
+    # HOA / Condo associations
+    "Association", "Condominium", "Homeowners", "HOA", "Property Owners",
+    "Community Association", "Owners Association",
+    # Utilities
+    "Electric", "Gas", "Water", "Power", "Energy", "Utility", "Utilities",
+    "Telephone", "Telecom", "Pipeline",
+    # Trust / IRA custodians
+    "Custodian", "FBO", "IRA Trust", "Trust Company", "Trustee",
+    "Fiduciary", "Custodial",
+    # Schools
+    "School", "University", "College", "Academy", "Institute", "Education",
+    # Other institutional
+    "Cemetery", "Hospital", "Medical Center", "Clinic",
+]
 
 TAGS_BLACKLIST = [
     "Liti", "DNC", "donotmail", "Takeoff", "Undeli", "Return", "Dead",
     "Do Not Mail", "Dono", "Do no", "Available"
+]
+
+# ── Channel-specific tag suppression ──────────────────────────────────────────
+TAGS_ALL_CHANNELS = [
+    "opted out", "dead lead", "not interested", "sold",
+    "undeliverable", "rts",
+]
+
+TAGS_DM_ONLY = [
+    "do not mail", "dnm", "litigator", "possible litigator", "dead call",
+]
+
+TAGS_CC_SMS_ONLY = [
+    "dnc", "do not call",
+]
+
+TAGS_CC_ONLY = [
+    "wrong number",
+]
+
+TAGS_NEVER_FILTER = [
+    "remove from marketing", "deceased", "probate", "bankruptcy",
+]
+
+# ── Address validation ─────────────────────────────────────────────────────────
+ADDRESS_VALIDATE_TYPES = ["sfh", "single family", "multi", "2-9 units", "condo"]
+ADDRESS_SKIP_TYPES     = ["land", "townhouse", "mobile"]
+
+VALID_MAILING_PATTERNS = [
+    r'^\s*p\.?o\.?\s*box',
+    r'^\s*rural\s+route',
+    r'^\s*r\.?r\.?\s*\d',
+    r'^\s*(hc|hcr)\s+\d',
+    r'^\s*(psc|unit|cmo)\s+\d',
+    r'^\s*general\s+delivery',
 ]
 
 # ── Audit Step ────────────────────────────────────────────────────────────────
