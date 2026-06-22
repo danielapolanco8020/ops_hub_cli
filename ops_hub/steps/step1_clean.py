@@ -1,4 +1,3 @@
-
 import re
 import time
 import pandas as pd
@@ -621,7 +620,14 @@ def _process_file(file: Path, output_dir: Path,
     # ── Auto-update filename K-count ───────────────────────────────────────────
     updated_name = _update_filename_k(file.stem, len(df))
     out_path     = output_dir / f"cleaned_{updated_name}.xlsx"
-    save_excel(df, out_path)
+
+    # Drop extra columns before saving clean file
+    extra_cols = [
+        "data_quality_flags", "OWNER FULL NAME ORIGINAL",
+        "ABSENTEE ORIGINAL", "Name_Issue", "Source_File",
+    ]
+    clean_df = df.drop(columns=[c for c in extra_cols if c in df.columns])
+    save_excel(clean_df, out_path)
     print_done(f"  Saved → {out_path.name}")
 
     # ── Accumulate rejects ─────────────────────────────────────────────────────
