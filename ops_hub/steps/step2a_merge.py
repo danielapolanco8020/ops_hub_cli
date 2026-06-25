@@ -29,6 +29,7 @@ def _unify_phone_columns(dataframes: list[pd.DataFrame]) -> list[pd.DataFrame]:
     """
     Across all files find the full set of PHONE NUMBER ## / PHONE TYPE ## columns.
     Add missing phone columns as empty to files that don't have them.
+    Columns are interleaved: PHONE NUMBER 1, PHONE TYPE 1, PHONE NUMBER 2, PHONE TYPE 2...
     """
     all_num_cols:  set[str] = set()
     all_type_cols: set[str] = set()
@@ -38,19 +39,37 @@ def _unify_phone_columns(dataframes: list[pd.DataFrame]) -> list[pd.DataFrame]:
         all_num_cols.update(n)
         all_type_cols.update(t)
 
-    all_num_cols  = sorted(all_num_cols,  key=lambda x: int(re.search(r'\d+', x).group()))
-    all_type_cols = sorted(all_type_cols, key=lambda x: int(re.search(r'\d+', x).group()))
+    # Get sorted unique numbers across both sets
+    all_nums = sorted(
+        set(int(re.search(r'\d+', c).group()) for c in all_num_cols | all_type_cols)
+    )
 
-    if all_num_cols or all_type_cols:
-        print_step(f"Phone columns detected across all files:")
-        print(f"    Numbers : {', '.join(all_num_cols) or 'none'}")
-        print(f"    Types   : {', '.join(all_type_cols) or 'none'}")
+    # Build interleaved column list: NUMBER 1, TYPE 1, NUMBER 2, TYPE 2...
+    interleaved = []
+    for n in all_nums:
+        num_col  = next((c for c in all_num_cols  if re.search(r'\d+', c).group() == str(n)), None)
+        type_col = next((c for c in all_type_cols if re.search(r'\d+', c).group() == str(n)), None)
+        if num_col:  interleaved.append(num_col)
+        if type_col: interleaved.append(type_col)
+
+    if interleaved:
+        print_step(f"Phone columns unified ({len(interleaved)} total, interleaved):")
+        print(f"    {', '.join(interleaved[:6])}{'...' if len(interleaved) > 6 else ''}")
 
     unified = []
     for df in dataframes:
-        for col in all_num_cols + all_type_cols:
+        for col in interleaved:
             if col not in df.columns:
                 df[col] = None
+        # Reorder phone columns in the DataFrame to match interleaved order
+        non_phone = [c for c in df.columns if c not in interleaved]
+        # Find where phone columns start in the original df
+        first_phone_pos = next(
+            (i for i, c in enumerate(non_phone) if False), len(non_phone)
+        )
+        # Insert interleaved phone cols after all non-phone cols
+        # keeping original non-phone column order
+        df = df[non_phone + interleaved]
         unified.append(df)
 
     return unified
@@ -192,8 +211,53 @@ def _merge_cadence(cadence: str, output_dir: Path):
     if sort_cols:
         merged.sort_values(by=sort_cols, ascending=[False] * len(sort_cols), inplace=True)
 
+    # ── Deduplication after merge ──────────────────────────────────────────────
+    before = len(merged)
+
+    for subset, label in [
+        (["MAILING ADDRESS", "MAILING ZIP"], "Mailing Address + ZIP"),
+        (["OWNER FULL NAME", "ADDRESS", "ZIP"], "Owner + Address + ZIP"),
+    ]:
+        cols_present = [c for c in subset if c in merged.columns]
+        if len(cols_present) == len(subset):
+            # Normalize before dedup
+            merged_norm = merged.copy()
+            for col in cols_present:
+                merged_norm[col] = merged_norm[col].astype(str).str.strip().str.upper()
+            duped = merged_norm.duplicated(subset=cols_present, keep="first")
+            removed = duped.sum()
+            merged = merged[~duped]
+            if removed:
+                print_done(f"  Duplicates removed ({label}): {removed:,}")
+
     total_k  = format_k(len(merged))
     out_name = _construct_filename(files[0].name, total_k)
+
+    # ── Row goal prompt ────────────────────────────────────────────────────────
+    total = len(merged)
+    print(f"\n  Total rows after merge: {total:,}")
+    while True:
+        raw = input(f"  Enter goal (or press Enter to keep all {total:,}): ").strip()
+        if raw == "":
+            break
+        try:
+            goal = int(raw)
+            if 1 <= goal <= total:
+                # Re-sort to ensure highest scores kept
+                sort_cols = [c for c in ["BUYBOX SCORE", "LIKELY DEAL SCORE", "SCORE"]
+                             if c in merged.columns]
+                if sort_cols:
+                    merged = merged.sort_values(by=sort_cols,
+                                                ascending=[False] * len(sort_cols))
+                merged  = merged.head(goal)
+                total_k = format_k(len(merged))
+                out_name = _construct_filename(files[0].name, total_k)
+                print_done(f"  Trimmed to {goal:,} rows — filename updated to reflect new count.")
+                break
+            print(f"  Enter a number between 1 and {total:,}.")
+        except ValueError:
+            print("  Enter a valid number.")
+
     out_path = output_dir / out_name
 
     save_excel(merged, out_path)

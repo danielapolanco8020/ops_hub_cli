@@ -11,6 +11,7 @@ from config import (
     TAGS_ALL_CHANNELS, TAGS_DM_ONLY, TAGS_CC_SMS_ONLY, TAGS_CC_ONLY,
     TAGS_NEVER_FILTER,
     ADDRESS_VALIDATE_TYPES, ADDRESS_SKIP_TYPES, VALID_MAILING_PATTERNS,
+    USPS_STATES,
 )
 from utils.file_helpers import (
     get_excel_files, read_excel, save_excel,
@@ -109,7 +110,30 @@ def _filter_absentee_same_address(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Da
     return df[~mask], rej
 
 
-# ── Tag normalization & channel-aware filter ───────────────────────────────────
+def _filter_invalid_state(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    V-01 — Discard records where STATE or MAILING STATE is not a valid USPS code.
+    Blank values are not flagged (handled by completeness rules).
+    Property side is checked first; either side failing discards the row.
+    """
+    def _get_reason(row) -> str | None:
+        for col, label in [("STATE", "STATE"), ("MAILING STATE", "MAILING STATE")]:
+            if col not in row.index:
+                continue
+            val = str(row[col]).strip().upper()
+            if val and val not in USPS_STATES:
+                return f"{label} '{val}' is not a valid USPS state code"
+        return None
+
+    reasons = df.apply(_get_reason, axis=1)
+    mask    = reasons.notna()
+    rej     = df[mask].copy()
+    rej["Rejection_Stage"] = "QUARANTINE-VALIDITY-INVALID_STATE"
+    rej["Rejection_Value"] = reasons[mask]
+    return df[~mask], rej
+
+
+
 
 def _normalize_tag(tag: str) -> str:
     tag = tag.lower().strip()
@@ -568,6 +592,11 @@ def _process_file(file: Path, output_dir: Path,
         if absentee_count > 0:
             before = len(df); _apply(_filter_absentee_same_address, df)
             print_done(f"  Absentee Same Address    : {before - len(df):,} removed (DM only)")
+
+    # ── V-01 Invalid state code ────────────────────────────────────────────────
+    if "STATE" in df.columns or "MAILING STATE" in df.columns:
+        before = len(df); _apply(_filter_invalid_state, df)
+        print_done(f"  Invalid State Code (V-01): {before - len(df):,} removed")
 
     # ── Address validation (flags only, no removal) ────────────────────────────
     df = _run_address_validation(df)
