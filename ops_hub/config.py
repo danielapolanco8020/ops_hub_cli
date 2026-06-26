@@ -1,4 +1,3 @@
-
 import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -161,7 +160,14 @@ TAGS_NEVER_FILTER = [
     "remove from marketing", "deceased", "probate", "bankruptcy",
 ]
 
-# ── Address validation ─────────────────────────────────────────────────────────
+# ── USPS Valid State Codes ─────────────────────────────────────────────────────
+USPS_STATES = {
+    "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN","IA",
+    "KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ",
+    "NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT",
+    "VA","WA","WV","WI","WY","DC","PR","VI","GU","AS","MP","FM","MH","PW",
+    "AA","AE","AP",
+}
 ADDRESS_VALIDATE_TYPES = ["sfh", "single family", "multi", "2-9 units", "condo"]
 ADDRESS_SKIP_TYPES     = ["land", "townhouse", "mobile"]
 
