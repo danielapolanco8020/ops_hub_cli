@@ -91,7 +91,13 @@ def _filter_empty_action_plans(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
 
 
 def _filter_duplicates(df: pd.DataFrame, subset: list[str], stage: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    duped_mask = df.duplicated(subset=subset, keep=False)
+    # Normalize subset columns before duplicate check
+    df_norm = df.copy()
+    for col in subset:
+        if col in df_norm.columns:
+            df_norm[col] = df_norm[col].astype(str).str.strip().str.upper()
+
+    duped_mask = df_norm.duplicated(subset=subset, keep="first")
     rej = df[duped_mask].copy()
     rej["Rejection_Stage"] = stage
     rej["Rejection_Value"] = rej.apply(
@@ -462,7 +468,8 @@ def _update_filename_k(name: str, row_count: int) -> str:
 def _prompt_clear_output_folders():
     from config import OUTPUT_DIR
     print("\n  ⚠  Starting a new clean process.")
-    folders = [f for f in OUTPUT_DIR.rglob("*.xlsx")]
+    folders = [f for f in OUTPUT_DIR.rglob("*.xlsx")
+               if f.name not in ("Rejection_Run_Log.xlsx", "Rejection_Summary.xlsx")]
     if not folders:
         print_done("  Output folders are already empty.")
         return
@@ -707,8 +714,14 @@ def _save_reports(rejected_all: list[pd.DataFrame],
                 .size()
                 .reset_index(name="Rejected_Count")
             )
-            save_excel(summary, output_dir / "Rejection_Summary.xlsx")
-            print_done("Rejection summary saved → Rejection_Summary.xlsx")
+            # Rejection summary — appends across runs
+            summary["Run_Timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            summary_path = output_dir / "Rejection_Summary.xlsx"
+            if summary_path.exists():
+                existing_summary = pd.read_excel(summary_path, engine="openpyxl")
+                summary = pd.concat([existing_summary, summary], ignore_index=True)
+            save_excel(summary, summary_path)
+            print_done("Rejection summary updated → Rejection_Summary.xlsx")
 
     # ── Flagged rows ───────────────────────────────────────────────────────────
     if flagged_all:
