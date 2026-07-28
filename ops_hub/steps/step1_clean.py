@@ -20,6 +20,31 @@ from utils.file_helpers import (
 )
 
 
+# ── Console colors ─────────────────────────────────────────────────────────────
+class C:
+    RESET    = "\033[0m"
+    GREEN    = "\033[92m"   # PASS / clean rows
+    YELLOW   = "\033[93m"   # FLAGGED / warnings / kept with issue
+    RED      = "\033[91m"   # REJECTED / removed
+    BLUE     = "\033[94m"   # Info / neutral messages
+    PURPLE   = "\033[95m"   # Case 3 name issues
+    DARK_RED = "\033[31m"   # Case 4 name issues
+    TEAL     = "\033[96m"   # 360 Fulfillment label
+    BOLD     = "\033[1m"
+
+def _color(text: str, color: str) -> str:
+    return f"{color}{text}{C.RESET}"
+
+def _pass(msg: str):
+    print(f"  {_color('[PASS]', C.GREEN)} {msg}")
+
+def _fail(msg: str):
+    print(f"  {_color('[REMOVED]', C.RED)} {msg}")
+
+def _flag(msg: str):
+    print(f"  {_color('[FLAGGED]', C.YELLOW)} {msg}")
+
+
 # ── Cadence detection ──────────────────────────────────────────────────────────
 
 def _get_cadence(filename: str) -> str:
@@ -91,7 +116,6 @@ def _filter_empty_action_plans(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataF
 
 
 def _filter_duplicates(df: pd.DataFrame, subset: list[str], stage: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    # Normalize subset columns before duplicate check
     df_norm = df.copy()
     for col in subset:
         if col in df_norm.columns:
@@ -117,11 +141,7 @@ def _filter_absentee_same_address(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Da
 
 
 def _filter_invalid_state(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    V-01 — Discard records where STATE or MAILING STATE is not a valid USPS code.
-    Blank values are not flagged (handled by completeness rules).
-    Property side is checked first; either side failing discards the row.
-    """
+    """V-01 — Discard records where STATE or MAILING STATE is not a valid USPS code."""
     def _get_reason(row) -> str | None:
         for col, label in [("STATE", "STATE"), ("MAILING STATE", "MAILING STATE")]:
             if col not in row.index:
@@ -139,7 +159,7 @@ def _filter_invalid_state(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
     return df[~mask], rej
 
 
-
+# ── Tag filtering ──────────────────────────────────────────────────────────────
 
 def _normalize_tag(tag: str) -> str:
     tag = tag.lower().strip()
@@ -207,7 +227,7 @@ ROAD_KEYWORDS = {
 }
 
 
-def _check_name_logic(row) -> str | None:
+def _check_name_logic(row) -> tuple[int, str] | None:
     full  = str(row.get("OWNER FULL NAME",  "") or "").strip()
     first = str(row.get("OWNER FIRST NAME", "") or "").strip()
     last  = str(row.get("OWNER LAST NAME",  "") or "").strip()
@@ -215,23 +235,27 @@ def _check_name_logic(row) -> str | None:
     if not full or not first or not last:
         return None
 
-    if re.match(r'^\d+$', first):
-        return f"First name is a number: '{first}'"
+    # Case 1 — First name is a number
+    if re.match(r'^\d+', first):
+        return (1, f"Case 1 — First name is a number: '{first}'")
 
+    # Case 2 — First name is a single letter or initial
     if re.match(r'^[A-Za-z]\.?$', first):
-        return f"First name is a single initial: '{first}'"
+        return (2, f"Case 2 — First name is a single initial: '{first}'")
 
+    # Case 3 — Last name contains road keywords (excluding St)
     last_words = {w.lower().rstrip(".") for w in last.split()}
     if last_words & ROAD_KEYWORDS:
-        return f"Last name contains road keyword: '{last}'"
+        return (3, f"Case 3 — Last name contains road keyword: '{last}'")
 
+    # Case 4 — No word from FIRST or LAST appears in FULL NAME
     full_words  = {w.lower().rstrip(".,") for w in full.split() if len(w) > 1}
     first_words = {w.lower().rstrip(".,") for w in first.split() if len(w) > 1}
     last_words2 = {w.lower().rstrip(".,") for w in last.split() if len(w) > 1}
     combined    = first_words | last_words2
 
     if combined and not (combined & full_words):
-        return f"No match between '{first} {last}' and full name '{full}'"
+        return (4, f"Case 4 — No match between '{first} {last}' and full name '{full}'")
 
     return None
 
@@ -243,36 +267,61 @@ def _filter_name_logic(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     df["OWNER FULL NAME ORIGINAL"] = df["OWNER FULL NAME"]
 
-    issues = df.apply(_check_name_logic, axis=1)
-    mask   = issues.notna()
+    results = df.apply(_check_name_logic, axis=1)
 
-    if not mask.any():
+    case1 = results.apply(lambda x: x is not None and x[0] == 1)
+    case2 = results.apply(lambda x: x is not None and x[0] == 2)
+    case3 = results.apply(lambda x: x is not None and x[0] == 3)
+    case4 = results.apply(lambda x: x is not None and x[0] == 4)
+
+    if not (case1 | case2 | case3 | case4).any():
         return df, pd.DataFrame()
 
-    flagged = df[mask].copy()
-    flagged["Name_Issue"] = issues[mask]
+    drop_mask = pd.Series(False, index=df.index)
 
-    print_warn(f"  Found {mask.sum():,} rows with name logic issues. Sample:")
-    for _, row in flagged.head(5).iterrows():
-        print(f"    FULL: '{row['OWNER FULL NAME']}' → "
-              f"FIRST: '{row['OWNER FIRST NAME']}' / "
-              f"LAST: '{row['OWNER LAST NAME']}' — {row['Name_Issue']}")
+    def _show_samples(mask, color):
+        for idx in df[mask].head(5).index:
+            row = df.loc[idx]
+            reason = results[idx][1]
+            line = (f"    FULL: '{row['OWNER FULL NAME']}' → "
+                    f"FIRST: '{row['OWNER FIRST NAME']}' / "
+                    f"LAST: '{row['OWNER LAST NAME']}' — {reason}")
+            print(f"  {_color(line, color)}")
 
-    remove = prompt_yes_no(
-        f"  Remove these {mask.sum():,} rows from output?",
-        default=False
-    )
+    # Cases 1 and 4 — auto drop
+    for mask, label in [
+        (case1, "Case 1 — first name is a number"),
+        (case4, "Case 4 — no name match in full name"),
+    ]:
+        if mask.any():
+            print_warn(f"  {label}: {mask.sum():,} rows — auto-dropped. Sample:")
+            _show_samples(mask, C.RED)
+            drop_mask |= mask
 
-    if remove:
-        rej = flagged.copy()
-        rej["Rejection_Stage"] = "Name Logic Issue"
-        rej["Rejection_Value"] = rej["Name_Issue"]
-        return df[~mask], rej
-    else:
-        df.loc[mask, "Name_Issue"] = issues[mask]
-        df = _add_flag(df, mask, "wrong_owner")
-        print_done(f"  {mask.sum():,} rows flagged in 'Name_Issue' column but kept.")
+    # Cases 2 and 3 — separate optional prompts
+    for mask, label in [
+        (case2, "Case 2 — single initial first name"),
+        (case3, "Case 3 — road keyword in last name"),
+    ]:
+        if not mask.any():
+            continue
+        print_warn(f"  {label}: {mask.sum():,} rows. Sample:")
+        _show_samples(mask, C.YELLOW)
+        if prompt_yes_no(f"  Drop these {mask.sum():,} rows?", default=False):
+            drop_mask |= mask
+        else:
+            df.loc[mask, "Name_Issue"] = results[mask].apply(lambda x: x[1])
+            df = _add_flag(df, mask, "wrong_owner")
+            print_done(f"  {mask.sum():,} rows flagged but kept.")
+
+    if not drop_mask.any():
         return df, pd.DataFrame()
+
+    rej = df[drop_mask].copy()
+    rej["Name_Issue"] = results[drop_mask].apply(lambda x: x[1])
+    rej["Rejection_Stage"] = "Name Logic Issue"
+    rej["Rejection_Value"] = rej["Name_Issue"]
+    return df[~drop_mask], rej
 
 
 # ── Address validation ─────────────────────────────────────────────────────────
@@ -463,6 +512,25 @@ def _update_filename_k(name: str, row_count: int) -> str:
     return new_name if new_name != name else name
 
 
+# ── Run type prompt ────────────────────────────────────────────────────────────
+
+def _prompt_run_type() -> str:
+    """Ask user if this is a 360 Fulfillment or Manual Pull. Default is 360."""
+    print(f"\n  {_color('Select run type:', C.BOLD)}")
+    print(f"    1. {_color('360 Fulfillment', C.TEAL)} (default) — full cleaning including Action Plans filter")
+    print(f"    2. {_color('Manual Pull', C.YELLOW)} — skips Action Plans filter, keeps properties without an action plan")
+    while True:
+        raw = input("  Enter choice [default: 1]: ").strip()
+        if raw == "" or raw == "1":
+            print_done(f"  Run type: {_color('360 Fulfillment', C.TEAL)}")
+            return "360"
+        elif raw == "2":
+            print_done(f"  Run type: {_color('Manual Pull', C.YELLOW)}")
+            return "manual"
+        else:
+            print("  Enter 1 or 2.")
+
+
 # ── Output folder cleanup ──────────────────────────────────────────────────────
 
 def _prompt_clear_output_folders():
@@ -492,7 +560,8 @@ def _prompt_clear_output_folders():
 
 def _process_file(file: Path, output_dir: Path,
                   rejected_all: list[pd.DataFrame],
-                  flagged_all:  list[pd.DataFrame]) -> dict:
+                  flagged_all:  list[pd.DataFrame],
+                  run_type:     str = "360") -> dict:
     t0      = time.time()
     df      = read_excel(file)
     cadence = _get_cadence(file.name)
@@ -560,9 +629,11 @@ def _process_file(file: Path, output_dir: Path,
     # ── Filters ────────────────────────────────────────────────────────────────
     print_step("Filters")
 
-    if "ACTION PLANS" in df.columns:
+    if "ACTION PLANS" in df.columns and run_type == "360":
         before = len(df); _apply(_filter_empty_action_plans, df)
         print_done(f"  Empty Action Plans       : {before - len(df):,} removed")
+    elif run_type == "manual":
+        print(f"  {_color('Empty Action Plans       : skipped (Manual Pull)', C.YELLOW)}")
 
     if {"MAILING ADDRESS", "MAILING ZIP"}.issubset(df.columns):
         before = len(df); _apply(_filter_duplicates, df, ["MAILING ADDRESS", "MAILING ZIP"], "Duplicate Address")
@@ -657,7 +728,6 @@ def _process_file(file: Path, output_dir: Path,
     updated_name = _update_filename_k(file.stem, len(df))
     out_path     = output_dir / f"cleaned_{updated_name}.xlsx"
 
-    # Drop extra columns before saving clean file
     extra_cols = [
         "data_quality_flags", "OWNER FULL NAME ORIGINAL",
         "ABSENTEE ORIGINAL", "Name_Issue", "Source_File",
@@ -708,13 +778,11 @@ def _save_reports(rejected_all: list[pd.DataFrame],
                                  + " — " + all_rej["Rejection_Value"].astype(str))
             frames.append(all_rej)
 
-            # Rejection summary
             summary = (
                 all_rej.groupby(["Source_File", "Rejection_Stage"])
                 .size()
                 .reset_index(name="Rejected_Count")
             )
-            # Rejection summary — appends across runs
             summary["Run_Timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             summary_path = output_dir / "Rejection_Summary.xlsx"
             if summary_path.exists():
@@ -733,7 +801,7 @@ def _save_reports(rejected_all: list[pd.DataFrame],
 
     # ── Combined Quality Report (overwritten each run) ─────────────────────────
     if frames:
-        combined     = pd.concat(frames, ignore_index=True)
+        combined      = pd.concat(frames, ignore_index=True)
         priority_cols = ["Status", "Reason", "Source_File"]
         other_cols    = [c for c in combined.columns if c not in priority_cols]
         combined      = combined[priority_cols + other_cols]
@@ -769,6 +837,7 @@ def _save_reports(rejected_all: list[pd.DataFrame],
 def run():
     print_header("STEP 1 — CLEAN")
 
+    run_type = _prompt_run_type()
     _prompt_clear_output_folders()
 
     files = get_excel_files(INPUT_DIR)
@@ -785,7 +854,7 @@ def run():
     for f in files:
         print_step(f"Processing: {f.name}")
         try:
-            result = _process_file(f, OUT_STEP1, rejected_all, flagged_all)
+            result = _process_file(f, OUT_STEP1, rejected_all, flagged_all, run_type)
         except Exception as e:
             import traceback
             traceback.print_exc()

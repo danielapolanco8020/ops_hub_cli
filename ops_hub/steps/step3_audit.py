@@ -14,12 +14,27 @@ from utils.file_helpers import (
 )
 
 
+class C:
+    RESET  = "\033[0m"
+    GREEN  = "\033[92m"
+    YELLOW = "\033[93m"
+    RED    = "\033[91m"
+
+def _color(text: str, color: str) -> str:
+    return f"{color}{text}{C.RESET}"
+
 def _check(label: str, passed: bool, detail: str = ""):
-    status = "PASS" if passed else "FAIL"
-    line   = f"  [{status}] {label}"
-    if detail:
-        line += f"  → {detail}"
-    print(line)
+    if passed:
+        print(f"  {_color('[PASS]', C.GREEN)} {label}")
+    else:
+        suffix = f"  → {detail}" if detail else ""
+        print(f"  {_color('[FAIL]', C.RED)} {label}{suffix}")
+
+
+_REPORT_FILES = {"Rejection_Run_Log.xlsx", "Rejection_Summary.xlsx", "Quality_Report.xlsx"}
+
+def _is_data_file(f: Path) -> bool:
+    return f.name not in _REPORT_FILES
 
 
 def _resolve_audit_files(input_dir: Path) -> list[Path]:
@@ -31,12 +46,12 @@ def _resolve_audit_files(input_dir: Path) -> list[Path]:
     from config import OUT_STEP1, OUT_STEP2
     from utils.file_helpers import get_excel_files
 
-    originals   = get_excel_files(OUT_STEP1)
+    originals   = [f for f in get_excel_files(OUT_STEP1) if _is_data_file(f)]
     split_files = [f for f in get_excel_files(OUT_STEP2) if f.name.startswith("split_")]
 
     # If no split files exist just use whatever is in input_dir
     if not split_files:
-        return get_excel_files(input_dir)
+        return [f for f in get_excel_files(input_dir) if _is_data_file(f)]
 
     selected = []
     matched_splits = set()
