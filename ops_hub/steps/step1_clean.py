@@ -874,7 +874,8 @@ def run():
         else:
             print_error(f"Failed to process {result['file']}")
 
-    _save_reports(rejected_all, flagged_all, OUT_STEP1)
+    if run_type == "360":
+        _save_reports(rejected_all, flagged_all, OUT_STEP1)
 
     # ── Final summary by channel ───────────────────────────────────────────────
     by_cadence: dict = defaultdict(lambda: {"in": 0, "cleaned": 0, "rejected": 0})
