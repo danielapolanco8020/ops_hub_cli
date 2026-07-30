@@ -324,6 +324,33 @@ def _filter_name_logic(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     return df[~drop_mask], rej
 
 
+# ── Vacant lot filter ──────────────────────────────────────────────────────────
+
+def _filter_vacant_lots(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if "ADDRESS" not in df.columns:
+        return df, pd.DataFrame()
+
+    mask = df["ADDRESS"].astype(str).str.match(r"^0\s")
+
+    if not mask.any():
+        return df, pd.DataFrame()
+
+    print_warn(f"  Vacant lot suspected (leading-zero address): {mask.sum():,} rows. Sample:")
+    for idx in df[mask].head(5).index:
+        addr = df.at[idx, "ADDRESS"]
+        print(f"  {_color(f'    ADDRESS: {addr!r}', C.YELLOW)}")
+
+    if prompt_yes_no(f"  Drop these {mask.sum():,} rows?", default=False):
+        rej = df[mask].copy()
+        rej["Rejection_Stage"] = "Vacant Lot"
+        rej["Rejection_Value"] = rej["ADDRESS"]
+        return df[~mask], rej
+
+    df = _add_flag(df, mask, "vacant_lot_suspected")
+    print_done(f"  {mask.sum():,} rows flagged but kept.")
+    return df, pd.DataFrame()
+
+
 # ── Address validation ─────────────────────────────────────────────────────────
 
 def _is_valid_mailing_format(address: str) -> bool:
@@ -660,6 +687,13 @@ def _process_file(file: Path, output_dir: Path,
     # ── Name logic validation ──────────────────────────────────────────────────
     if {"OWNER FULL NAME", "OWNER FIRST NAME", "OWNER LAST NAME"}.issubset(df.columns):
         df, rej = _filter_name_logic(df)
+        if not rej.empty:
+            rej["Source_File"] = file.name
+            rejects.append(rej)
+
+    # ── Vacant lot filter ──────────────────────────────────────────────────────
+    if "ADDRESS" in df.columns:
+        df, rej = _filter_vacant_lots(df)
         if not rej.empty:
             rej["Source_File"] = file.name
             rejects.append(rej)
