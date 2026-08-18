@@ -92,14 +92,6 @@ def _resolve_audit_files(input_dir: Path) -> list[Path]:
     return selected
 
 
-
-    status = "PASS" if passed else "FAIL"
-    line   = f"  [{status}] {label}"
-    if detail:
-        line += f"  → {detail}"
-    print(line)
-
-
 def _audit_file(df: pd.DataFrame, file_path: Path):
     print(f"\n  File : {file_path.name}")
     print(f"  Rows : {len(df):,}")

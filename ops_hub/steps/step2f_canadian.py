@@ -31,10 +31,10 @@ def run():
     files = list({f.name: f for f in all_files}.values())
 
     if not files:
-        print_error(f"No Excel files found in {input_dir.name}/")
+        print_error("No Excel files found in output folders.")
         return
 
-    print_step(f"Found {len(files)} file(s) in {input_dir.name}/")
+    print_step(f"Found {len(files)} file(s) across output folders.")
 
     all_canadian: list[pd.DataFrame] = []
 

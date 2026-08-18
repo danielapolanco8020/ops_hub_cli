@@ -1,10 +1,11 @@
+import re
 import pandas as pd
 from pathlib import Path
 
 from config import OUT_STEP3, OUT_STEP2, OUT_STEP1, OUT_STEP4, SKIPTRACE_EXPORT_COLUMNS
 from utils.file_helpers import (
     get_files_by_cadence, read_excel, save_excel,
-    make_output_path,
+    make_output_path, prompt_yes_no,
     print_header, print_step, print_done, print_warn, print_error,
 )
 
@@ -33,6 +34,12 @@ def run():
             break
         else:
             print("  Enter 1, 2 or 3.")
+
+    # ── Skiptrace filter ───────────────────────────────────────────────────────
+    filter_skiptraced = prompt_yes_no(
+        "\n  Export only properties without phone numbers?",
+        default=True,
+    )
 
     source_cols  = list(SKIPTRACE_EXPORT_COLUMNS.keys())
     all_frames: list[pd.DataFrame] = []
@@ -63,6 +70,21 @@ def run():
             if missing:
                 print_warn(f"  Missing columns: {', '.join(missing)} — skipping.")
                 continue
+
+            # Filter to properties without phone numbers
+            if filter_skiptraced:
+                phone_cols = [c for c in df.columns
+                              if re.match(r'PHONE NUMBER\s*\d+', c, re.IGNORECASE)]
+                if phone_cols:
+                    has_phone = df[phone_cols].apply(
+                        lambda col: col.replace("", pd.NA).notna()
+                    ).any(axis=1)
+                    before  = len(df)
+                    df      = df[~has_phone]
+                    removed = before - len(df)
+                    print_done(f"  {removed:,} with phone numbers removed → {len(df):,} need skiptrace.")
+                else:
+                    print_warn("  No PHONE NUMBER columns found — exporting all rows.")
 
             all_frames.append(df[source_cols].copy())
             print_done(f"  {len(df):,} rows loaded.")

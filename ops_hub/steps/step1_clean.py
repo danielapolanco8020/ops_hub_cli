@@ -11,12 +11,15 @@ from config import (
     TAGS_ALL_CHANNELS, TAGS_DM_ONLY, TAGS_CC_SMS_ONLY, TAGS_CC_ONLY,
     TAGS_NEVER_FILTER,
     ADDRESS_VALIDATE_TYPES, ADDRESS_SKIP_TYPES, VALID_MAILING_PATTERNS,
-    USPS_STATES,
+    USPS_STATES, COUNTY_MASTER_LOCAL,
 )
 from utils.file_helpers import (
     get_excel_files, read_excel, save_excel,
     prompt_yes_no, print_header, print_step, print_done,
     print_warn, print_error,
+)
+from utils.county_helpers import (
+    load_master, build_domain_index, check_coverage,
 )
 
 
@@ -501,6 +504,25 @@ def _correct_absentee(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ── Pre-foreclosure correction ─────────────────────────────────────────────────
+
+def _correct_preforeclosure(df: pd.DataFrame) -> pd.DataFrame:
+    if "PRE-FORECLOSURE" not in df.columns:
+        return df
+
+    df["PRE-FORECLOSURE"] = pd.to_numeric(df["PRE-FORECLOSURE"], errors="coerce")
+    mask  = df["PRE-FORECLOSURE"] == 0.8
+    count = mask.sum()
+
+    if count:
+        df.loc[mask, "PRE-FORECLOSURE"] = 1
+        df = _add_flag(df, mask, "preforeclosure_corrected")
+        print_step("  Pre-foreclosure correction:")
+        print_done(f"    0.8→1 corrected    : {count:,} rows flagged")
+
+    return df
+
+
 # ── Geographic distribution ────────────────────────────────────────────────────
 
 def _capture_distribution(df: pd.DataFrame, col: str) -> dict[str, float]:
@@ -558,6 +580,33 @@ def _prompt_run_type() -> str:
             print("  Enter 1 or 2.")
 
 
+# ── County coverage check ──────────────────────────────────────────────────────
+
+def _report_county_coverage(df: pd.DataFrame, filename: str, domain_index: dict) -> dict:
+    """Run the active-counties coverage check for one file and print the result."""
+    result = check_coverage(df, filename, domain_index)
+
+    print_step("County Coverage Check")
+    if not result["matched"]:
+        print_warn(f"  No master match for client token '{result['token']}' — county check skipped.")
+        return result
+
+    print(f"    Client        : {result['client_name']}")
+    print(f"    Active counties: {len(result['active'])}  |  Present: {len(result['present'])}")
+
+    if result["missing"]:
+        print(f"  {_color('[FAIL]', C.RED)} Missing counties in fulfillment: "
+              f"{', '.join(sorted(result['missing']))}")
+    else:
+        print(f"  {_color('[PASS]', C.GREEN)} All active counties present in fulfillment.")
+
+    if result["extra"]:
+        print(f"  {_color('[INFO]', C.BLUE)} Counties in file not on active list: "
+              f"{', '.join(sorted(result['extra']))}")
+
+    return result
+
+
 # ── Output folder cleanup ──────────────────────────────────────────────────────
 
 def _prompt_clear_output_folders():
@@ -588,7 +637,8 @@ def _prompt_clear_output_folders():
 def _process_file(file: Path, output_dir: Path,
                   rejected_all: list[pd.DataFrame],
                   flagged_all:  list[pd.DataFrame],
-                  run_type:     str = "360") -> dict:
+                  run_type:     str = "360",
+                  domain_index: dict | None = None) -> dict:
     t0      = time.time()
     df      = read_excel(file)
     cadence = _get_cadence(file.name)
@@ -716,6 +766,9 @@ def _process_file(file: Path, output_dir: Path,
     # ── Absentee correction (all cadences) ────────────────────────────────────
     df = _correct_absentee(df)
 
+    # ── Pre-foreclosure correction (all cadences) ──────────────────────────────
+    df = _correct_preforeclosure(df)
+
     cleaned_rows = len(df)
     print_done(f"\n  Cleaned: {cleaned_rows:,} rows (from {original_rows:,})")
 
@@ -758,6 +811,14 @@ def _process_file(file: Path, output_dir: Path,
             df = df.head(goal)
             print_done(f"  Trimmed to {goal:,} rows keeping highest scores.")
 
+    # ── County coverage check (mandatory) ──────────────────────────────────────
+    county_result = None
+    if domain_index is not None:
+        county_result = _report_county_coverage(df, file.name, domain_index)
+        if county_result is not None:
+            county_result["file"]            = file.name
+            county_result["total_file_rows"] = original_rows
+
     # ── Auto-update filename K-count ───────────────────────────────────────────
     updated_name = _update_filename_k(file.stem, len(df))
     out_path     = output_dir / f"cleaned_{updated_name}.xlsx"
@@ -774,6 +835,7 @@ def _process_file(file: Path, output_dir: Path,
     non_empty = [r for r in rejects if isinstance(r, pd.DataFrame) and not r.empty]
     if non_empty:
         combined_rej = pd.concat(non_empty, ignore_index=True)
+        combined_rej["Total_File_Rows"] = original_rows
         rejected_all.append(combined_rej)
 
     # ── Accumulate flagged rows ────────────────────────────────────────────────
@@ -781,6 +843,7 @@ def _process_file(file: Path, output_dir: Path,
         flagged = df[df["data_quality_flags"].astype(str).str.strip() != ""].copy()
         if not flagged.empty:
             flagged["Source_File"] = file.name
+            flagged["Total_File_Rows"] = original_rows
             flagged_all.append(flagged)
 
     elapsed = time.time() - t0
@@ -792,6 +855,7 @@ def _process_file(file: Path, output_dir: Path,
         "cleaned":  len(df),
         "rejected": original_rows - len(df),
         "time":     round(elapsed, 2),
+        "county":   county_result,
     }
 
 
@@ -799,7 +863,8 @@ def _process_file(file: Path, output_dir: Path,
 
 def _save_reports(rejected_all: list[pd.DataFrame],
                   flagged_all:  list[pd.DataFrame],
-                  output_dir:   Path):
+                  output_dir:   Path,
+                  county_all:   list | None = None):
 
     frames = []
 
@@ -812,19 +877,6 @@ def _save_reports(rejected_all: list[pd.DataFrame],
                                  + " — " + all_rej["Rejection_Value"].astype(str))
             frames.append(all_rej)
 
-            summary = (
-                all_rej.groupby(["Source_File", "Rejection_Stage"])
-                .size()
-                .reset_index(name="Rejected_Count")
-            )
-            summary["Run_Timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            summary_path = output_dir / "Rejection_Summary.xlsx"
-            if summary_path.exists():
-                existing_summary = pd.read_excel(summary_path, engine="openpyxl")
-                summary = pd.concat([existing_summary, summary], ignore_index=True)
-            save_excel(summary, summary_path)
-            print_done("Rejection summary updated → Rejection_Summary.xlsx")
-
     # ── Flagged rows ───────────────────────────────────────────────────────────
     if flagged_all:
         all_flagged = pd.concat([f for f in flagged_all if not f.empty], ignore_index=True)
@@ -832,6 +884,87 @@ def _save_reports(rejected_all: list[pd.DataFrame],
             all_flagged["Status"] = "Flagged"
             all_flagged["Reason"] = all_flagged["data_quality_flags"].astype(str)
             frames.append(all_flagged)
+
+    # ── Rejection Summary (appends across runs) ────────────────────────────────
+    summary_frames = []
+
+    if rejected_all:
+        all_rej_s = pd.concat([r for r in rejected_all if not r.empty], ignore_index=True)
+        if not all_rej_s.empty:
+            rej_grp = (
+                all_rej_s.groupby(["Source_File", "Rejection_Stage"])
+                .agg(Count=("Rejection_Stage", "size"),
+                     Total_File_Rows=("Total_File_Rows", "first"))
+                .reset_index()
+                .rename(columns={"Rejection_Stage": "Stage_or_Flag"})
+            )
+            rej_grp["Status"] = "Rejected"
+            summary_frames.append(rej_grp)
+
+    if flagged_all:
+        all_flag_s = pd.concat([f for f in flagged_all if not f.empty], ignore_index=True)
+        if not all_flag_s.empty:
+            flag_grp = (
+                all_flag_s.groupby(["Source_File", "data_quality_flags"])
+                .agg(Count=("data_quality_flags", "size"),
+                     Total_File_Rows=("Total_File_Rows", "first"))
+                .reset_index()
+                .rename(columns={"data_quality_flags": "Stage_or_Flag"})
+            )
+            flag_grp["Status"] = "Flagged"
+            summary_frames.append(flag_grp)
+
+    # ── County coverage → summary rows ─────────────────────────────────────────
+    if county_all:
+        from config import COUNTY_LOW_COVERAGE_PCT
+        county_rows = []
+        for cr in county_all:
+            if not cr or not cr.get("matched"):
+                continue
+            src        = cr.get("file")
+            total_rows = cr.get("total_file_rows")
+            total      = cr.get("total", 0)
+
+            # Missing active counties → Rejected, count 1 each
+            for county in sorted(cr.get("missing", [])):
+                county_rows.append({
+                    "Source_File":     src,
+                    "Total_File_Rows": total_rows,
+                    "Status":          "Rejected",
+                    "Stage_or_Flag":   "Missing county",
+                    "Count":           1,
+                })
+
+            # Under-represented counties (< threshold of fulfillment) → Flagged
+            if total > 0:
+                for county, cnt in cr.get("county_counts", {}).items():
+                    if cnt / total < COUNTY_LOW_COVERAGE_PCT:
+                        county_rows.append({
+                            "Source_File":     src,
+                            "Total_File_Rows": total_rows,
+                            "Status":          "Flagged",
+                            "Stage_or_Flag":   "County presence below 5%",
+                            "Count":           int(cnt),
+                        })
+
+        if county_rows:
+            summary_frames.append(pd.DataFrame(county_rows))
+
+    if summary_frames:
+        summary = pd.concat(summary_frames, ignore_index=True)
+        summary["Run_Timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        col_order = ["Run_Timestamp", "Source_File", "Total_File_Rows",
+                     "Status", "Stage_or_Flag", "Count"]
+        summary = summary[[c for c in col_order if c in summary.columns]]
+        summary_path = output_dir / "Rejection_Summary.xlsx"
+        if summary_path.exists():
+            existing_summary = pd.read_excel(summary_path, engine="openpyxl")
+            summary = pd.concat([existing_summary, summary], ignore_index=True)
+        save_excel(summary, summary_path)
+        n_rej  = summary["Status"].eq("Rejected").sum()
+        n_flag = summary["Status"].eq("Flagged").sum()
+        print_done(f"Rejection summary updated → Rejection_Summary.xlsx  "
+                   f"({n_rej:,} rejected rows, {n_flag:,} flagged rows across all runs)")
 
     # ── Combined Quality Report (overwritten each run) ─────────────────────────
     if frames:
@@ -846,24 +979,42 @@ def _save_reports(rejected_all: list[pd.DataFrame],
                    f"({rejected_count:,} rejected, {flagged_count:,} flagged)")
 
     # ── Cumulative Run Log (appends across runs) ───────────────────────────────
+    log_frames = []
+
     if rejected_all:
         all_rej = pd.concat([r for r in rejected_all if not r.empty], ignore_index=True)
         if not all_rej.empty:
-            run_log_path = output_dir / "Rejection_Run_Log.xlsx"
-            all_rej["Run_Timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            log_cols = ["Run_Timestamp", "Source_File", "Rejection_Stage",
-                        "Rejection_Value", "OWNER FULL NAME", "ADDRESS", "ZIP",
-                        "MAILING ADDRESS", "MAILING ZIP", "FOLIO"]
-            log_cols_present = [c for c in log_cols if c in all_rej.columns]
-            run_entry = all_rej[log_cols_present].copy()
+            all_rej["Status"] = "Rejected"
+            log_frames.append(all_rej)
 
-            if run_log_path.exists():
-                existing = pd.read_excel(run_log_path, engine="openpyxl")
-                run_entry = pd.concat([existing, run_entry], ignore_index=True)
+    if flagged_all:
+        all_flagged = pd.concat([f for f in flagged_all if not f.empty], ignore_index=True)
+        if not all_flagged.empty:
+            all_flagged["Status"] = "Flagged"
+            all_flagged["Rejection_Stage"] = all_flagged["data_quality_flags"]
+            all_flagged["Rejection_Value"] = all_flagged["data_quality_flags"]
+            log_frames.append(all_flagged)
 
-            save_excel(run_entry, run_log_path)
-            print_done(f"Run log updated → Rejection_Run_Log.xlsx  "
-                       f"({len(run_entry):,} total entries across all runs)")
+    if log_frames:
+        run_log_path = output_dir / "Rejection_Run_Log.xlsx"
+        combined_log = pd.concat(log_frames, ignore_index=True)
+        combined_log["Run_Timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        log_cols = ["Run_Timestamp", "Status", "Source_File", "Total_File_Rows",
+                    "Rejection_Stage", "Rejection_Value",
+                    "OWNER FULL NAME", "ADDRESS", "ZIP",
+                    "MAILING ADDRESS", "MAILING ZIP", "FOLIO"]
+        log_cols_present = [c for c in log_cols if c in combined_log.columns]
+        run_entry = combined_log[log_cols_present].copy()
+
+        if run_log_path.exists():
+            existing = pd.read_excel(run_log_path, engine="openpyxl")
+            run_entry = pd.concat([existing, run_entry], ignore_index=True)
+
+        save_excel(run_entry, run_log_path)
+        n_rej  = (run_entry["Status"] == "Rejected").sum()
+        n_flag = (run_entry["Status"] == "Flagged").sum()
+        print_done(f"Run log updated → Rejection_Run_Log.xlsx  "
+                   f"({n_rej:,} rejected, {n_flag:,} flagged across all runs)")
 
 
 # ── Entry Point ────────────────────────────────────────────────────────────────
@@ -881,6 +1032,17 @@ def run():
 
     print_step(f"Found {len(files)} file(s) in {INPUT_DIR.name}/")
 
+    # ── Load county master file (mandatory county coverage check) ──────────────
+    master_df, master_src = load_master()
+    if master_df is not None:
+        domain_index = build_domain_index(master_df)
+        print_done(f"County master loaded from {master_src} — {len(domain_index):,} clients indexed.")
+    else:
+        domain_index = None
+        print_warn("County master file not found (Google Drive not mounted and no local copy) — "
+                   "county coverage check will be skipped.")
+        print_warn(f"  To enable it, drop the master CSV into: {COUNTY_MASTER_LOCAL}")
+
     rejected_all: list[pd.DataFrame] = []
     flagged_all:  list[pd.DataFrame] = []
     results = []
@@ -888,7 +1050,7 @@ def run():
     for f in files:
         print_step(f"Processing: {f.name}")
         try:
-            result = _process_file(f, OUT_STEP1, rejected_all, flagged_all, run_type)
+            result = _process_file(f, OUT_STEP1, rejected_all, flagged_all, run_type, domain_index)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -909,7 +1071,8 @@ def run():
             print_error(f"Failed to process {result['file']}")
 
     if run_type == "360":
-        _save_reports(rejected_all, flagged_all, OUT_STEP1)
+        county_all = [r.get("county") for r in results if r.get("county")]
+        _save_reports(rejected_all, flagged_all, OUT_STEP1, county_all)
 
     # ── Final summary by channel ───────────────────────────────────────────────
     by_cadence: dict = defaultdict(lambda: {"in": 0, "cleaned": 0, "rejected": 0})
