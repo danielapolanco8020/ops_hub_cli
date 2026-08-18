@@ -1,6 +1,18 @@
 import os
+import sys
 import pandas as pd
 from pathlib import Path
+
+os.system("")  # enable ANSI escape codes on Windows
+if sys.stdout.encoding and sys.stdout.encoding.lower() != "utf-8":
+    sys.stdout.reconfigure(encoding="utf-8")
+
+_RESET  = "\033[0m"
+_GREEN  = "\033[92m"
+_YELLOW = "\033[93m"
+_RED    = "\033[91m"
+_BLUE   = "\033[94m"
+_BOLD   = "\033[1m"
 
 
 # ── File Discovery ─────────────────────────────────────────────────────────────
@@ -124,10 +136,28 @@ def prompt_float(question: str, default: float) -> float:
 
 # ── File I/O ───────────────────────────────────────────────────────────────────
 
+def _pad_zip(val) -> str:
+    """Zero-pad a ZIP value to 5 digits if it was read as a number (e.g. 1234 → '01234')."""
+    if pd.isna(val):
+        return val
+    s = str(val).strip()
+    if '.' in s:
+        s = s.split('.')[0]
+    return s.zfill(5) if s.isdigit() and len(s) < 5 else s
+
+
+def _fix_zip_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Restore leading zeros in any column whose name contains 'ZIP'."""
+    for col in [c for c in df.columns if "ZIP" in c.upper()]:
+        df[col] = df[col].apply(_pad_zip)
+    return df
+
+
 def read_excel(path: Path) -> pd.DataFrame | None:
     """Read an Excel file safely. Returns None on failure."""
     try:
-        return pd.read_excel(path, engine="openpyxl")
+        df = pd.read_excel(path, engine="openpyxl")
+        return _fix_zip_columns(df)
     except Exception as e:
         print(f"  [ERROR] Could not read {path.name}: {e}")
         return None
@@ -195,22 +225,22 @@ def check_missing_columns(df: pd.DataFrame, required: list[str], label: str = ""
 # ── Progress Helpers ───────────────────────────────────────────────────────────
 
 def print_header(title: str):
-    print("\n" + "=" * 60)
-    print(f"  {title}")
-    print("=" * 60)
+    print("\n" + f"{_BOLD}" + "=" * 60 + f"{_RESET}")
+    print(f"  {_BOLD}{title}{_RESET}")
+    print(f"{_BOLD}" + "=" * 60 + f"{_RESET}")
 
 
 def print_step(msg: str):
-    print(f"\n  → {msg}")
+    print(f"\n  {_BLUE}→ {msg}{_RESET}")
 
 
 def print_done(msg: str):
-    print(f"  ✓ {msg}")
+    print(f"  {_GREEN}✓ {msg}{_RESET}")
 
 
 def print_warn(msg: str):
-    print(f"  ⚠  {msg}")
+    print(f"  {_YELLOW}⚠  {msg}{_RESET}")
 
 
 def print_error(msg: str):
-    print(f"  ✗ {msg}")
+    print(f"  {_RED}✗ {msg}{_RESET}")
