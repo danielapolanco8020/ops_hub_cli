@@ -22,6 +22,24 @@ OUT_ZESTIMATE_MG = OUTPUT_DIR / "zestimate" / "merged"
 MERGE_ZESTIMATE  = MERGE_DIR / "zestimate"
 MERGE_SKIPTRACE  = MERGE_DIR / "skiptrace"
 
+# ── County Master File (Active Counties coverage check) ───────────────────────
+# Primary source: Google Drive Desktop mount (machine-dependent).
+# Fallback source: local folder where a user without Drive can drop the CSV.
+COUNTY_MASTER_DRIVE = Path(
+    r"G:\.shortcut-targets-by-id\1nJVflP2GIzXFjArMBwqzP7HVVHPdhTs1"
+    r"\Client folders\AA county master file"
+)
+COUNTY_MASTER_LOCAL = MERGE_DIR / "county_master"
+
+# Master file column names
+COUNTY_MASTER_NAME_COL     = "Name"
+COUNTY_MASTER_DOMAIN_COL   = "Domain (8020REI)"
+COUNTY_MASTER_COUNTIES_COL = "Active Counties"
+
+# A county whose share of the fulfillment is below this fraction is flagged as
+# under-represented in the Rejection Summary.
+COUNTY_LOW_COVERAGE_PCT = 0.05
+
 # ── Auto-create all directories ───────────────────────────────────────────────
 DIRS_TO_CREATE = [
     INPUT_DIR,
@@ -33,6 +51,7 @@ DIRS_TO_CREATE = [
     OUT_ZESTIMATE_MG,
     MERGE_ZESTIMATE,
     MERGE_SKIPTRACE,
+    COUNTY_MASTER_LOCAL,
 ]
 
 for d in DIRS_TO_CREATE:
