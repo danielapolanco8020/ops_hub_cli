@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 from config import (
     INPUT_DIR, OUT_STEP1,
     UNWANTED_NAMES, INSTITUTIONAL_KEYWORDS,
+    INSTITUTIONAL_QUALIFIED_KEYWORDS, INSTITUTIONAL_QUALIFIERS,
     TAGS_ALL_CHANNELS, TAGS_DM_ONLY, TAGS_CC_SMS_ONLY, TAGS_CC_ONLY,
     TAGS_NEVER_FILTER,
     ADDRESS_VALIDATE_TYPES, ADDRESS_SKIP_TYPES, VALID_MAILING_PATTERNS,
@@ -74,11 +75,20 @@ def _fix_link_properties(df: pd.DataFrame) -> pd.DataFrame:
 # ── Data quality flags helper ──────────────────────────────────────────────────
 
 def _add_flag(df: pd.DataFrame, mask: pd.Series, flag: str) -> pd.DataFrame:
+    """Append `flag` to data_quality_flags for every masked row in a single
+    vectorized pass.
+
+    Callers MUST pass one boolean mask covering the whole frame — never call this
+    once per row in a loop. Building a full-length mask per row was the O(n²)
+    hot spot that made Step 1 crawl on large files.
+    """
     if "data_quality_flags" not in df.columns:
         df["data_quality_flags"] = ""
-    df.loc[mask, "data_quality_flags"] = df.loc[mask, "data_quality_flags"].apply(
-        lambda x: f"{x}|{flag}" if x else flag
-    )
+    if mask is None or not mask.any():
+        return df
+    existing = df.loc[mask, "data_quality_flags"].fillna("").astype(str)
+    prefix   = existing.where(existing.eq(""), existing + "|")   # "" stays "", else "val|"
+    df.loc[mask, "data_quality_flags"] = prefix + flag
     return df
 
 
@@ -101,12 +111,59 @@ def _filter_unwanted_names(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
     return df[~mask], rej
 
 
+def _wb_pattern(tokens: list[str]) -> "re.Pattern":
+    """Whole-word (\\b…\\b) alternation, case-insensitive. Matching actual words
+    instead of substrings stops keywords colliding with surnames — e.g. "Gas" no
+    longer matches "Vargas", "Bank" no longer matches "Banks"."""
+    return re.compile(r"\b(?:" + "|".join(map(re.escape, tokens)) + r")\b", re.IGNORECASE)
+
+
 def _filter_institutional_owners(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    pattern = re.compile("|".join(map(re.escape, INSTITUTIONAL_KEYWORDS)), re.IGNORECASE)
-    mask    = df["OWNER FULL NAME"].str.contains(pattern, na=False)
-    rej     = df[mask].copy()
+    name = df["OWNER FULL NAME"]
+
+    # Strong keywords — a whole-word match alone flags the row as institutional.
+    # This catches mislabeled non-sellers (school/church/utility) regardless of the
+    # OWNER TYPE column, which is exactly what this filter is for.
+    strong_mask = name.str.contains(_wb_pattern(INSTITUTIONAL_KEYWORDS), na=False)
+
+    # Ambiguous keywords (Power/Temple/Church) are also common surnames, so they
+    # only count as institutional when a supporting qualifier word is also present
+    # ("Zion Temple", "Power Praise") — a bare "Betty J Temple" stays an individual.
+    qualified_mask = (
+        name.str.contains(_wb_pattern(INSTITUTIONAL_QUALIFIED_KEYWORDS), na=False)
+        & name.str.contains(_wb_pattern(INSTITUTIONAL_QUALIFIERS), na=False)
+    )
+
+    mask = strong_mask | qualified_mask
+    rej  = df[mask].copy()
     rej["Rejection_Stage"] = "Institutional Owner"
     rej["Rejection_Value"] = rej["OWNER FULL NAME"]
+    return df[~mask], rej
+
+
+# Secondary unit / apartment designators. "#" is matched on its own (it is not a
+# word character); the rest are matched as whole words so "Fl" won't hit a street
+# name and "Lot" won't hit part of a word.
+SFH_UNIT_PATTERN = re.compile(
+    r"(?i)(?:#|\b(?:unit|apt|apartment|ste|suite|bldg|building|rm|room|"
+    r"spc|space|trlr|trailer|lot|dept|fl|floor)\b)"
+)
+
+
+def _filter_sfh_with_unit(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """A single-family home (PROPERTY TYPE == "SFH") should not carry a unit or
+    apartment designator in its address — such a row is usually a duplex or
+    apartment mislabeled as SFH. Drop those rows."""
+    if not {"PROPERTY TYPE", "ADDRESS"}.issubset(df.columns):
+        return df, pd.DataFrame()
+
+    is_sfh   = df["PROPERTY TYPE"].astype(str).str.strip().str.lower() == "sfh"
+    has_unit = df["ADDRESS"].astype(str).str.contains(SFH_UNIT_PATTERN, na=False)
+    mask     = is_sfh & has_unit
+
+    rej = df[mask].copy()
+    rej["Rejection_Stage"] = "SFH With Unit Number"
+    rej["Rejection_Value"] = rej["ADDRESS"]
     return df[~mask], rej
 
 
@@ -229,6 +286,20 @@ ROAD_KEYWORDS = {
     "hwy", "pkwy", "cir", "loop", "ter", "pass"
 }
 
+def _initial_matches_full_start(full: str, initial: str) -> bool:
+    """Return True if `initial` (a single-letter first name) is the leading
+    character of the full name, ignoring leading spaces and invisible characters.
+
+    'R Thomas Navas' + 'R' → True    (initial leads the name → coherent split)
+    'Ellen M Krause' + 'M' → False   (initial came from the middle → bad split)
+    """
+    letter = initial.strip().rstrip(".").lower()
+    for ch in full:
+        if ch.isspace() or not ch.isprintable():   # skip spaces + invisible chars
+            continue
+        return ch.lower() == letter
+    return False
+
 
 def _check_name_logic(row) -> tuple[int, str] | None:
     full  = str(row.get("OWNER FULL NAME",  "") or "").strip()
@@ -242,9 +313,15 @@ def _check_name_logic(row) -> tuple[int, str] | None:
     if re.match(r'^\d+', first):
         return (1, f"Case 1 — First name is a number: '{first}'")
 
-    # Case 2 — First name is a single letter or initial
+    # Case 2 — First name is a single letter or initial.
+    # A leading initial is a coherent split — "R Thomas Navas" → first 'R',
+    # last 'Thomas Navas' — and is left alone. It is only flagged when the initial
+    # is NOT the first character of the full name, which means the initial was
+    # pulled out of the middle and the split is wrong (e.g. "Ellen M Krause"
+    # parsed to first 'M').
     if re.match(r'^[A-Za-z]\.?$', first):
-        return (2, f"Case 2 — First name is a single initial: '{first}'")
+        if not _initial_matches_full_start(full, first):
+            return (2, f"Case 2 — Initial '{first}' is not the first name in '{full}'")
 
     # Case 3 — Last name contains road keywords (excluding St)
     last_words = {w.lower().rstrip(".") for w in last.split()}
@@ -301,21 +378,38 @@ def _filter_name_logic(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
             _show_samples(mask, C.RED)
             drop_mask |= mask
 
-    # Cases 2 and 3 — separate optional prompts
-    for mask, label in [
-        (case2, "Case 2 — single initial first name"),
-        (case3, "Case 3 — road keyword in last name"),
-    ]:
-        if not mask.any():
-            continue
-        print_warn(f"  {label}: {mask.sum():,} rows. Sample:")
-        _show_samples(mask, C.YELLOW)
-        if prompt_yes_no(f"  Drop these {mask.sum():,} rows?", default=False):
-            drop_mask |= mask
+    # Case 2 — single initial first name — optional prompt (unchanged)
+    if case2.any():
+        print_warn(f"  Case 2 — single initial first name: {case2.sum():,} rows. Sample:")
+        _show_samples(case2, C.YELLOW)
+        if prompt_yes_no(f"  Drop these {case2.sum():,} rows?", default=False):
+            drop_mask |= case2
         else:
-            df.loc[mask, "Name_Issue"] = results[mask].apply(lambda x: x[1])
-            df = _add_flag(df, mask, "wrong_owner")
-            print_done(f"  {mask.sum():,} rows flagged but kept.")
+            df.loc[case2, "Name_Issue"] = results[case2].apply(lambda x: x[1])
+            df = _add_flag(df, case2, "wrong_owner")
+            print_done(f"  {case2.sum():,} rows flagged but kept.")
+
+    # Case 3 — road keyword in last name — decided by OWNER TYPE.
+    #   A last name containing a road/trust token (e.g. "Tr", "Ret", "Ave") is
+    #   ambiguous: it can be a legitimate Trust ("Smith Family Ret") or Company
+    #   ("Danbury Rd Realty Llc") whose entity name merely looks address-like, or a
+    #   genuine street dumped into an individual's name field. We defer to OWNER TYPE:
+    #     • OWNER TYPE in ("Trust", "Company") → legitimate owner, KEEP (not dropped/flagged)
+    #     • any other owner type (Individual/Estate/…) → DROP as a Name Logic Issue
+    if case3.any():
+        if "OWNER TYPE" in df.columns:
+            owner_type = df["OWNER TYPE"].astype(str).str.strip().str.lower()
+            is_entity  = owner_type.isin(["trust", "company"])
+            case3_keep = case3 & is_entity
+            case3_drop = case3 & ~is_entity
+            print_warn(f"  Case 3 — road keyword in last name: {case3.sum():,} rows "
+                       f"→ {case3_keep.sum():,} Trust/Company kept, {case3_drop.sum():,} dropped.")
+            if case3_drop.any():
+                _show_samples(case3_drop, C.PURPLE)
+            drop_mask |= case3_drop
+        else:
+            print_warn(f"  Case 3 — road keyword in last name: {case3.sum():,} rows, "
+                       f"but no OWNER TYPE column — keeping all (cannot classify).")
 
     if not drop_mask.any():
         return df, pd.DataFrame()
@@ -395,36 +489,40 @@ def _run_address_validation(df: pd.DataFrame) -> pd.DataFrame:
         skip_mask       = prop_type_lower.apply(
             lambda t: any(s in t for s in ADDRESS_SKIP_TYPES)
         )
-        validate_idx = df[~skip_mask].index
+        validate_mask = ~skip_mask
     else:
-        validate_idx = df.index
+        validate_mask = pd.Series(True, index=df.index)
 
-    prop_issues   = {}
-    mail_issues   = {}
-    prop_examples = {}
-    mail_examples = {}
+    def _validate_column(col: str, validator, flag: str) -> tuple[dict, dict]:
+        """Validate one address column across all non-skipped rows in a single
+        pass, flag every offending row at once, and return
+        (issue_counts, first_example_per_issue) — matching the previous per-row
+        tallies and 'first occurrence in row order' example selection."""
+        nonlocal df
+        issues = pd.Series(index=df.index, dtype=object)
+        issues.loc[validate_mask] = df.loc[validate_mask, col].apply(validator)
+
+        issue_mask = issues.notna()
+        if issue_mask.any():
+            df = _add_flag(df, issue_mask, flag)
+
+        counts   = issues[issue_mask].value_counts().to_dict()
+        examples = {}
+        for key in counts:
+            first_idx     = issues.index[issues == key][0]
+            examples[key] = df.at[first_idx, col]
+        return counts, examples
+
+    prop_issues, prop_examples = ({}, {})
+    mail_issues, mail_examples = ({}, {})
 
     if "ADDRESS" in df.columns:
-        for idx in validate_idx:
-            issue = _validate_property_address(df.at[idx, "ADDRESS"])
-            if issue:
-                prop_issues[issue] = prop_issues.get(issue, 0) + 1
-                if issue not in prop_examples:
-                    prop_examples[issue] = df.at[idx, "ADDRESS"]
-                flag_mask = df.index == idx
-                df = _add_flag(df, pd.Series(flag_mask, index=df.index),
-                               "incomplete_property_address")
+        prop_issues, prop_examples = _validate_column(
+            "ADDRESS", _validate_property_address, "incomplete_property_address")
 
     if "MAILING ADDRESS" in df.columns:
-        for idx in validate_idx:
-            issue = _validate_mailing_address(df.at[idx, "MAILING ADDRESS"])
-            if issue:
-                mail_issues[issue] = mail_issues.get(issue, 0) + 1
-                if issue not in mail_examples:
-                    mail_examples[issue] = df.at[idx, "MAILING ADDRESS"]
-                flag_mask = df.index == idx
-                df = _add_flag(df, pd.Series(flag_mask, index=df.index),
-                               "incomplete_mailing_address")
+        mail_issues, mail_examples = _validate_column(
+            "MAILING ADDRESS", _validate_mailing_address, "incomplete_mailing_address")
 
     total_prop = sum(prop_issues.values())
     total_mail = sum(mail_issues.values())
@@ -463,34 +561,30 @@ def _correct_absentee(df: pd.DataFrame) -> pd.DataFrame:
 
     df["ABSENTEE ORIGINAL"] = df["ABSENTEE"]
 
-    corrected_to_2 = 0
-    corrected_to_1 = 0
-    null_count     = 0
+    prop_state    = df["STATE"].astype(str).str.strip().str.upper()
+    mail_state    = df["MAILING STATE"].astype(str).str.strip().str.upper()
+    states_differ = prop_state != mail_state
 
-    for idx in df.index:
-        absentee   = df.at[idx, "ABSENTEE"]
-        prop_state = str(df.at[idx, "STATE"]).strip().upper()
-        mail_state = str(df.at[idx, "MAILING STATE"]).strip().upper()
+    absentee_num = pd.to_numeric(df["ABSENTEE"], errors="coerce")
+    is_null      = df["ABSENTEE"].isna() | (df["ABSENTEE"].astype(str).str.strip() == "")
 
-        if pd.isna(absentee) or str(absentee).strip() == "":
-            null_count += 1
-            df = _add_flag(df, pd.Series(df.index == idx, index=df.index), "absentee_null")
-            continue
+    # 1 → 2 : marked in-state but property/mailing states differ (really out of state)
+    to_2 = (~is_null) & (absentee_num == 1) & states_differ
+    # 2 → 1 : marked out-of-state but the states actually match
+    to_1 = (~is_null) & (absentee_num == 2) & (~states_differ)
 
-        absentee = int(absentee)
+    df.loc[to_2, "ABSENTEE"] = 2
+    df.loc[to_1, "ABSENTEE"] = 1
 
-        if absentee == 0:
-            continue
+    corrected = to_2 | to_1
+    if corrected.any():
+        df = _add_flag(df, corrected, "absentee_corrected")
+    if is_null.any():
+        df = _add_flag(df, is_null, "absentee_null")
 
-        if absentee == 1 and prop_state != mail_state:
-            df.at[idx, "ABSENTEE"] = 2
-            corrected_to_2 += 1
-            df = _add_flag(df, pd.Series(df.index == idx, index=df.index), "absentee_corrected")
-
-        elif absentee == 2 and prop_state == mail_state:
-            df.at[idx, "ABSENTEE"] = 1
-            corrected_to_1 += 1
-            df = _add_flag(df, pd.Series(df.index == idx, index=df.index), "absentee_corrected")
+    corrected_to_2 = int(to_2.sum())
+    corrected_to_1 = int(to_1.sum())
+    null_count     = int(is_null.sum())
 
     if corrected_to_2 or corrected_to_1 or null_count:
         print_step("  Absentee correction:")
@@ -733,6 +827,10 @@ def _process_file(file: Path, output_dir: Path,
     if "TAGS" in df.columns:
         before = len(df); _apply(_filter_tags, df, cadence)
         print_done(f"  Blacklisted Tags ({cadence.upper():<3})   : {before - len(df):,} removed")
+
+    if {"PROPERTY TYPE", "ADDRESS"}.issubset(df.columns):
+        before = len(df); _apply(_filter_sfh_with_unit, df)
+        print_done(f"  SFH With Unit Number     : {before - len(df):,} removed")
 
     # ── Name logic validation ──────────────────────────────────────────────────
     if {"OWNER FULL NAME", "OWNER FIRST NAME", "OWNER LAST NAME"}.issubset(df.columns):
@@ -1001,7 +1099,9 @@ def _save_reports(rejected_all: list[pd.DataFrame],
         combined_log["Run_Timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         log_cols = ["Run_Timestamp", "Status", "Source_File", "Total_File_Rows",
                     "Rejection_Stage", "Rejection_Value",
-                    "OWNER FULL NAME", "ADDRESS", "ZIP",
+                    "OWNER FULL NAME", "OWNER FIRST NAME", "OWNER LAST NAME",
+                    "OWNER TYPE", "PROPERTY TYPE",
+                    "ADDRESS", "ZIP",
                     "MAILING ADDRESS", "MAILING ZIP", "FOLIO"]
         log_cols_present = [c for c in log_cols if c in combined_log.columns]
         run_entry = combined_log[log_cols_present].copy()
