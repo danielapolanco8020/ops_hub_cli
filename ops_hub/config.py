@@ -126,6 +126,13 @@ UNWANTED_NAMES = [
     "City of", "Not Provided Name", "Redacted Upon Request"
 ]
 
+# Strong institutional keywords — a WHOLE-WORD match on any of these is enough to
+# flag an owner as an institution (matched with \b…\b boundaries in the filter, so
+# "Gas" no longer hits "Vargas", "Bank" no longer hits "Banks", etc.).
+# NOTE: "HOA" was removed — the 3-letter token collided with names like "Hoa";
+# real HOAs are still caught by "Homeowners" / "Association" / "Owners Association".
+# "Power", "Temple" and "Church" were moved to INSTITUTIONAL_QUALIFIED_KEYWORDS
+# below because they are also common surnames.
 INSTITUTIONAL_KEYWORDS = [
     # Banks & financial
     "Bank", "Bancorp", "Bankers", "Mortgage", "Lending", "Loan", "Financial",
@@ -135,13 +142,13 @@ INSTITUTIONAL_KEYWORDS = [
     "City of", "County of", "State of", "Department", "Authority",
     "Commission", "Municipality", "Federal", "Housing Authority",
     # Religious
-    "Church", "Temple", "Ministry", "Ministries", "Diocese", "Parish",
+    "Ministry", "Ministries", "Diocese", "Parish",
     "Cathedral", "Mosque", "Synagogue", "Fellowship", "Assembly of God",
     # HOA / Condo associations
-    "Association", "Condominium", "Homeowners", "HOA", "Property Owners",
+    "Association", "Condominium", "Homeowners", "Property Owners",
     "Community Association", "Owners Association",
     # Utilities
-    "Electric", "Gas", "Water", "Power", "Energy", "Utility", "Utilities",
+    "Electric", "Gas", "Water", "Energy", "Utility", "Utilities",
     "Telephone", "Telecom", "Pipeline",
     # Trust / IRA custodians
     "Custodian", "FBO", "IRA Trust", "Trust Company", "Trustee",
@@ -150,6 +157,28 @@ INSTITUTIONAL_KEYWORDS = [
     "School", "University", "College", "Academy", "Institute", "Education",
     # Other institutional
     "Cemetery", "Hospital", "Medical Center", "Clinic",
+]
+
+# Ambiguous keywords that are ALSO common surnames ("Michael Power", "Betty
+# Temple", "John Church"). These are only treated as institutional when one of the
+# supporting qualifier words below also appears in the same owner name — e.g.
+# "Zion Temple" / "Power Praise" (kept as institutions) vs "Betty J Temple" (kept
+# as an individual).
+INSTITUTIONAL_QUALIFIED_KEYWORDS = ["Power", "Temple", "Church"]
+
+INSTITUTIONAL_QUALIFIERS = [
+    # Religious / church-name context
+    "Baptist", "Methodist", "Pentecostal", "Catholic", "Christian", "Zion",
+    "Israel", "Ministry", "Ministries", "Deliverance", "Praise", "Faith",
+    "Gospel", "God", "Holy", "Grace", "Trinity", "Bible", "Worship",
+    "Congregation", "Fellowship", "Assembly", "Sanctuary", "Chapel",
+    "Apostolic", "Evangel", "Redeemer", "Salvation", "Mission", "Prophetic",
+    "Saint", "St", "First", "Community", "Memorial", "Iglesia", "Christ",
+    "Lord", "Jesus", "Spirit", "Kingdom", "Covenant", "Calvary",
+    # Corporate / utility / civic context
+    "Company", "Co", "Inc", "Corp", "Corporation", "Cooperative", "Coop",
+    "Utility", "Utilities", "Authority", "District", "Electric", "Energy",
+    "Municipal", "Public", "Light", "LLC",
 ]
 
 TAGS_BLACKLIST = [
