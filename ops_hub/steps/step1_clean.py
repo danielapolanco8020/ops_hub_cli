@@ -1096,10 +1096,15 @@ def _process_file(file: Path, output_dir: Path,
     updated_name = _update_filename_k(file.stem, len(df))
     out_path     = output_dir / f"cleaned_{updated_name}.xlsx"
 
+    # Drop the overlap "Last recommendation" columns for every channel — they are
+    # only used by the overlap check and must not appear in the cleaned output.
+    overlap_cols = [find_column(df, [name]) for name in OVERLAP_COLUMNS.values()]
+    overlap_cols = [c for c in overlap_cols if c]
+
     extra_cols = [
         "data_quality_flags", "OWNER FULL NAME ORIGINAL",
         "ABSENTEE ORIGINAL", "Name_Issue", "Source_File",
-    ]
+    ] + overlap_cols
     clean_df = df.drop(columns=[c for c in extra_cols if c in df.columns])
     save_excel(clean_df, out_path)
     print_done(f"  Saved → {out_path.name}")
