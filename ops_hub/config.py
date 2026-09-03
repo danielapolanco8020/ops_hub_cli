@@ -57,6 +57,23 @@ DIRS_TO_CREATE = [
 for d in DIRS_TO_CREATE:
     d.mkdir(parents=True, exist_ok=True)
 
+# ── Excel I/O engines ─────────────────────────────────────────────────────────
+# Single source of truth for how the pipeline reads/writes .xlsx. EVERY step goes
+# through utils.file_helpers (read_excel / read_many_parallel / save_excel /
+# save_excel_multisheet), so changing these two flags changes the whole pipeline
+# at once — no step touches an engine directly.
+#
+# READ_ENGINE  "calamine"   — Rust reader, ~6x faster than openpyxl, byte-for-byte
+#                             identical output (verified on real files); releases
+#                             the GIL so parallel reads scale.
+# WRITE_ENGINE "xlsxwriter" — ~2.2x faster writes and ~3x smaller files than
+#                             openpyxl, identical data. URL auto-linking is disabled
+#                             centrally (see file_helpers._writer_kwargs) so
+#                             LINK PROPERTIES stays plain text like before.
+# Set either back to "openpyxl" to revert instantly.
+READ_ENGINE  = "calamine"
+WRITE_ENGINE = "xlsxwriter"
+
 # ── Cadences ──────────────────────────────────────────────────────────────────
 CADENCES = ["Direct Mail", "Cold Calling", "SMS"]
 
@@ -151,7 +168,10 @@ INSTITUTIONAL_KEYWORDS = [
     "Electric", "Gas", "Water", "Energy", "Utility", "Utilities",
     "Telephone", "Telecom", "Pipeline",
     # Trust / IRA custodians
-    "Custodian", "FBO", "IRA Trust", "Trust Company", "Trustee",
+    # NOTE: "Trustee" is intentionally NOT here — trustee-type tokens are governed
+    # solely by the dedicated trustee filter (see TRUSTEE_TOKENS below), which keeps
+    # a record only when OWNER TYPE == 'Trust'.
+    "Custodian", "FBO", "IRA Trust", "Trust Company",
     "Fiduciary", "Custodial",
     # Schools
     "School", "University", "College", "Academy", "Institute", "Education",
@@ -179,6 +199,36 @@ INSTITUTIONAL_QUALIFIERS = [
     "Company", "Co", "Inc", "Corp", "Corporation", "Cooperative", "Coop",
     "Utility", "Utilities", "Authority", "District", "Electric", "Energy",
     "Municipal", "Public", "Light", "LLC",
+]
+
+# ── Strong entity tokens (Institutional Owner last-resort tiebreaker) ─────────
+# The ONLY thing that can override an explicit OWNER TYPE == 'Individual' after a
+# whole-word institutional keyword has still fired on a real-looking surname
+# (e.g. "Parish"). If any of these appears as a whole word, the row is a genuine
+# entity and stays rejected regardless of OWNER TYPE. Matched with the same
+# whole-word (hyphen-aware) logic as the institutional keywords.
+STRONG_ENTITY_TOKENS = [
+    "LLC", "L.L.C.", "Inc", "Corp", "Company", "Co", "Trust", "Tr", "Trs",
+    "Bank", "Mortgage", "Holdings", "Investments", "Realty", "Properties",
+    "LP", "Partners", "Fund", "Association", "Assn", "HOA", "Condominium",
+    "Custodian", "FBO",
+]
+
+# Common given names that also appear in INSTITUTIONAL_QUALIFIERS. When the
+# Institutional Owner tiebreaker decides whether to rescue an 'Individual', these
+# words do NOT count as institutional context — so a real person (e.g. "Grace
+# Parish", "Jesus Rivera") is never blocked from rescue by their own first name.
+RESCUE_NAME_EXCEPTIONS = {
+    "christian", "faith", "grace", "trinity", "israel", "jesus", "christ", "zion",
+}
+
+# ── Trustee tokens (trust-held property) ──────────────────────────────────────
+# A trustee-type token in OWNER FULL NAME means the property is held in trust. The
+# ONLY valid reason to keep such a record is OWNER TYPE == 'Trust'; every other
+# owner type — Individual, Company, Estate, or a blank one — is dropped. Handled by
+# its own filter (authoritative for these tokens), matched as whole words.
+TRUSTEE_TOKENS = [
+    "trustee", "trustees", "co-trustee", "ttee", "trs", "successor trustee",
 ]
 
 TAGS_BLACKLIST = [
@@ -227,6 +277,19 @@ VALID_MAILING_PATTERNS = [
     r'^\s*(psc|unit|cmo)\s+\d',
     r'^\s*general\s+delivery',
 ]
+
+# ── Overlap Check ─────────────────────────────────────────────────────────────
+# A property "overlaps" when its last recommendation for this cadence is within
+# OVERLAP_DAYS of the run date. If more than OVERLAP_ALERT_PCT of a file overlaps,
+# the overlapping properties are flagged ("overlapping") and a console alert is
+# printed. The column used is chosen by cadence; a missing column is skipped.
+OVERLAP_DAYS      = 30
+OVERLAP_ALERT_PCT = 0.30
+OVERLAP_COLUMNS   = {
+    "dm":  "Last recommendation DM",
+    "cc":  "Last recommendation CC",
+    "sms": "Last recommendation SMS",
+}
 
 # ── Audit Step ────────────────────────────────────────────────────────────────
 AUDIT_URGENT_PLAN      = "30 DAYS"
