@@ -4,7 +4,7 @@ from pathlib import Path
 
 from config import OUT_STEP1, OUT_STEP2, REQUIRED_COLUMNS, CADENCES
 from utils.file_helpers import (
-    get_files_by_cadence, read_excel, save_excel,
+    get_files_by_cadence, read_many_parallel, save_excel,
     prompt_cadence_or_all, format_k,
     print_header, print_step, print_done, print_warn, print_error,
 )
@@ -176,11 +176,12 @@ def _merge_cadence(cadence: str, output_dir: Path):
 
     print_step(f"Processing '{cadence}' — {len(files)} file(s) found")
 
-    # Load all files
+    # Load all files (reads run in parallel; input order preserved)
+    frames_map = read_many_parallel(files)
     raw_frames: list[pd.DataFrame] = []
     raw_names:  list[str]          = []
     for f in files:
-        df = read_excel(f)
+        df = frames_map.get(f)
         if df is None:
             continue
         print(f"    Loading: {f.name}")

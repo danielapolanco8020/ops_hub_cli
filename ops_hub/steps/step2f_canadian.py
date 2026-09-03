@@ -3,7 +3,7 @@ from pathlib import Path
 
 from config import OUT_STEP2, OUT_STEP1, CANADIAN_PROVINCES
 from utils.file_helpers import (
-    get_excel_files, get_files_by_cadence, read_excel, save_excel,
+    get_excel_files, get_files_by_cadence, read_many_parallel, save_excel,
     find_column,
     print_header, print_step, print_done, print_warn, print_error,
 )
@@ -38,9 +38,10 @@ def run():
 
     all_canadian: list[pd.DataFrame] = []
 
+    frames_map = read_many_parallel(files)
     for f in files:
         print_step(f"Processing: {f.name}")
-        df = read_excel(f)
+        df = frames_map.get(f)
         if df is None:
             continue
 

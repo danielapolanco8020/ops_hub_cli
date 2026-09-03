@@ -7,7 +7,7 @@ from pathlib import Path
 from config import OUT_STEP2, OUT_STEP1
 
 from utils.file_helpers import (
-    get_excel_files, get_files_by_cadence, read_excel, save_excel,
+    get_excel_files, get_files_by_cadence, read_many_parallel, save_excel,
     prompt_int, prompt_yes_no, make_output_path,
     print_header, print_step, print_done, print_warn, print_error,
 )
@@ -219,9 +219,10 @@ def run():
 
     totals = [0, 0, 0, 0]  # under_1, between, over_2, no_tag
 
+    frames_map = read_many_parallel(all_files)
     for f in all_files:
         print_step(f"Processing: {f.name}")
-        df = read_excel(f)
+        df = frames_map.get(f)
         if df is None:
             continue
 

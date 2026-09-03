@@ -5,7 +5,7 @@ from pathlib import Path
 
 from config import OUT_STEP2, OUT_STEP1, SPLIT_VALID_PLANS, SPLIT_DEFAULT_WEEKS
 from utils.file_helpers import (
-    get_files_by_cadence, read_excel, save_excel_multisheet,
+    get_files_by_cadence, read_many_parallel, save_excel_multisheet,
     prompt_cadence_or_all, prompt_yes_no, prompt_int,
     print_header, print_step, print_done, print_warn, print_error,
     make_output_path,
@@ -289,9 +289,10 @@ def run():
             print_warn(f"No files found for '{cadence}'")
             continue
 
+        frames_map = read_many_parallel(files)
         for f in files:
             print_step(f"{f.name}  [{mode_label}]")
-            df = read_excel(f)
+            df = frames_map.get(f)
             if df is None:
                 continue
             try:

@@ -7,7 +7,7 @@ from config import (
     ZESTIMATE_VALUE_COL, ZESTIMATE_OUTPUT_COL,
 )
 from utils.file_helpers import (
-    get_excel_files, get_files_by_cadence, read_excel, save_excel,
+    get_excel_files, get_files_by_cadence, read_excel, read_many_parallel, save_excel,
     prompt_file_selection, print_header, print_step, print_done,
     print_warn, print_error, make_output_path,
 )
@@ -32,9 +32,10 @@ def run_export():
     files = get_files_by_cadence(input_dir, "Direct Mail")
     print_step(f"Found {len(files)} Direct Mail file(s) in {input_dir.name}/")
 
+    frames_map = read_many_parallel(files)
     for f in files:
         print_step(f"Processing: {f.name}")
-        df = read_excel(f)
+        df = frames_map.get(f)
         if df is None:
             continue
 
@@ -92,9 +93,12 @@ def run_merge():
         if results_path.suffix.lower() == ".csv":
             wse_df = pd.read_csv(results_path)
         else:
-            wse_df = pd.read_excel(results_path, engine="openpyxl")
+            wse_df = read_excel(results_path)
     except Exception as e:
         print_error(f"Could not read results file: {e}")
+        return
+    if wse_df is None:
+        print_error(f"Could not read results file: {results_path.name}")
         return
 
     print_done(f"Results loaded: {len(wse_df):,} rows")

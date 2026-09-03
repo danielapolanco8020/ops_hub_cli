@@ -9,13 +9,15 @@ from config import (
     INPUT_DIR, OUT_STEP1,
     UNWANTED_NAMES, INSTITUTIONAL_KEYWORDS,
     INSTITUTIONAL_QUALIFIED_KEYWORDS, INSTITUTIONAL_QUALIFIERS,
+    STRONG_ENTITY_TOKENS, RESCUE_NAME_EXCEPTIONS, TRUSTEE_TOKENS,
     TAGS_ALL_CHANNELS, TAGS_DM_ONLY, TAGS_CC_SMS_ONLY, TAGS_CC_ONLY,
     TAGS_NEVER_FILTER,
     ADDRESS_VALIDATE_TYPES, ADDRESS_SKIP_TYPES, VALID_MAILING_PATTERNS,
     USPS_STATES, COUNTY_MASTER_LOCAL,
+    OVERLAP_DAYS, OVERLAP_ALERT_PCT, OVERLAP_COLUMNS,
 )
 from utils.file_helpers import (
-    get_excel_files, read_excel, save_excel,
+    get_excel_files, read_excel, save_excel, find_column,
     prompt_yes_no, print_header, print_step, print_done,
     print_warn, print_error,
 )
@@ -112,10 +114,19 @@ def _filter_unwanted_names(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
 
 
 def _wb_pattern(tokens: list[str]) -> "re.Pattern":
-    """Whole-word (\\b…\\b) alternation, case-insensitive. Matching actual words
-    instead of substrings stops keywords colliding with surnames — e.g. "Gas" no
-    longer matches "Vargas", "Bank" no longer matches "Banks"."""
-    return re.compile(r"\b(?:" + "|".join(map(re.escape, tokens)) + r")\b", re.IGNORECASE)
+    """Whole-word alternation, case-insensitive. A token matches only when it is
+    delimited by whitespace, a string end, or punctuation OTHER THAN a hyphen —
+    the hyphen counts as part of the word, so a keyword can never fire inside a
+    larger token. This stops keywords colliding with surnames both when the letters
+    are joined ("Gas" in "Vargas", "Bank" in "Banks") AND when they are hyphenated
+    ("loan" in "Cam-loan", "Phuong-loan").
+
+    Lookarounds are used instead of \\b because \\b treats a hyphen as a boundary,
+    which would still wrongly match "loan" inside "Cam-loan"."""
+    return re.compile(
+        r"(?<![\w-])(?:" + "|".join(map(re.escape, tokens)) + r")(?![\w-])",
+        re.IGNORECASE,
+    )
 
 
 def _filter_institutional_owners(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -135,10 +146,70 @@ def _filter_institutional_owners(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
     )
 
     mask = strong_mask | qualified_mask
+
+    # ── Change 2 (last resort): OWNER TYPE tiebreaker ──────────────────────────
+    # After whole-word matching, some genuine keywords still fire on real surnames
+    # (e.g. "Parish", "Gas"). OWNER TYPE is only ~24% populated and is a weaker
+    # signal, so it is consulted ONLY for rows still flagged above: keep the row
+    # when OWNER TYPE is explicitly "Individual" AND the name carries no strong
+    # entity token (LLC, Inc, Trust, Bank, …). Every other case — a blank/other
+    # owner type, or an entity token present — stays rejected.
+    if "OWNER TYPE" in df.columns and mask.any():
+        owner_type    = df["OWNER TYPE"].astype(str).str.strip().str.lower()
+        is_individual = owner_type == "individual"
+        has_entity    = name.str.contains(_wb_pattern(STRONG_ENTITY_TOKENS), na=False)
+
+        # A religious/civic context word (e.g. "St", "Saint", "First", "Holy",
+        # "Ministry") means the name is an institution even when OWNER TYPE says
+        # Individual — "St Marcus Parish" is not a person's name. Common given names
+        # that also live in the qualifier list (Grace, Faith, Jesus, …) are excluded
+        # so a real person is not blocked from rescue by their own first name.
+        context_tokens = [q for q in INSTITUTIONAL_QUALIFIERS
+                          if q.lower() not in RESCUE_NAME_EXCEPTIONS]
+        has_context    = name.str.contains(_wb_pattern(context_tokens), na=False)
+
+        rescued        = mask & is_individual & ~has_entity & ~has_context
+        if rescued.any():
+            print_done(f"  Institutional Owner rescue: {rescued.sum():,} 'Individual' "
+                       f"row(s) kept (whole-word keyword, no entity/context token).")
+        mask = mask & ~rescued
+
     rej  = df[mask].copy()
     rej["Rejection_Stage"] = "Institutional Owner"
     rej["Rejection_Value"] = rej["OWNER FULL NAME"]
     return df[~mask], rej
+
+
+def _filter_trustee_tokens(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """A trustee-type token in OWNER FULL NAME (trustee, trustees, co-trustee, ttee,
+    trs, successor trustee) means the property is held in trust. The only valid
+    reason to keep such a record is OWNER TYPE == 'Trust'; every other owner type —
+    including a blank/unpopulated one — is dropped.
+
+    This is the authoritative rule for trustee tokens: "Trustee" is deliberately
+    excluded from INSTITUTIONAL_KEYWORDS so this stage and the Institutional Owner
+    stage cannot disagree. Tokens are matched as whole words (hyphen-aware), so
+    "co-trustee" matches as a unit and "trs" never fires inside a larger word."""
+    if "OWNER FULL NAME" not in df.columns:
+        return df, pd.DataFrame()
+
+    has_token = df["OWNER FULL NAME"].str.contains(_wb_pattern(TRUSTEE_TOKENS), na=False)
+    if not has_token.any():
+        return df, pd.DataFrame()
+
+    if "OWNER TYPE" in df.columns:
+        is_trust = df["OWNER TYPE"].astype(str).str.strip().str.lower() == "trust"
+    else:
+        is_trust = pd.Series(False, index=df.index)
+
+    drop_mask = has_token & ~is_trust
+    if not drop_mask.any():
+        return df, pd.DataFrame()
+
+    rej = df[drop_mask].copy()
+    rej["Rejection_Stage"] = "Trustee — non-Trust owner type"
+    rej["Rejection_Value"] = rej["OWNER FULL NAME"]
+    return df[~drop_mask], rej
 
 
 # Secondary unit / apartment designators. "#" is matched on its own (it is not a
@@ -200,10 +271,21 @@ def _filter_absentee_same_address(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Da
     return df[~mask], rej
 
 
-def _filter_invalid_state(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """V-01 — Discard records where STATE or MAILING STATE is not a valid USPS code."""
+def _filter_invalid_state(df: pd.DataFrame, check_mailing: bool = True) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """V-01 — Discard records with an invalid USPS code.
+
+    The property STATE is validated on every cadence (a bad property state is a
+    genuine data-quality problem regardless of channel). The MAILING STATE is only
+    validated when `check_mailing` is True — i.e. Direct Mail — because that is the
+    only cadence we actually mail to, so an abroad/foreign mailing address should
+    disqualify a row on DM but not on Cold Calling or SMS.
+    """
+    cols_to_check = [("STATE", "STATE")]
+    if check_mailing:
+        cols_to_check.append(("MAILING STATE", "MAILING STATE"))
+
     def _get_reason(row) -> str | None:
-        for col, label in [("STATE", "STATE"), ("MAILING STATE", "MAILING STATE")]:
+        for col, label in cols_to_check:
             if col not in row.index:
                 continue
             val = str(row[col]).strip().upper()
@@ -301,10 +383,13 @@ def _initial_matches_full_start(full: str, initial: str) -> bool:
     return False
 
 
-def _check_name_logic(row) -> tuple[int, str] | None:
-    full  = str(row.get("OWNER FULL NAME",  "") or "").strip()
-    first = str(row.get("OWNER FIRST NAME", "") or "").strip()
-    last  = str(row.get("OWNER LAST NAME",  "") or "").strip()
+def _name_logic_core(full_raw, first_raw, last_raw) -> tuple[int, str] | None:
+    """Core name-logic check operating on three raw cell values. Called in a tight
+    zip() loop by _filter_name_logic (~5x faster than df.apply(axis=1) on large
+    files, byte-identical output) and via the _check_name_logic row wrapper below."""
+    full  = str(full_raw  or "").strip()
+    first = str(first_raw or "").strip()
+    last  = str(last_raw  or "").strip()
 
     if not full or not first or not last:
         return None
@@ -340,6 +425,15 @@ def _check_name_logic(row) -> tuple[int, str] | None:
     return None
 
 
+def _check_name_logic(row) -> tuple[int, str] | None:
+    """Row-wise wrapper around _name_logic_core (kept for any row-based callers)."""
+    return _name_logic_core(
+        row.get("OWNER FULL NAME", ""),
+        row.get("OWNER FIRST NAME", ""),
+        row.get("OWNER LAST NAME", ""),
+    )
+
+
 def _filter_name_logic(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     required = {"OWNER FULL NAME", "OWNER FIRST NAME", "OWNER LAST NAME"}
     if not required.issubset(df.columns):
@@ -347,7 +441,11 @@ def _filter_name_logic(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
 
     df["OWNER FULL NAME ORIGINAL"] = df["OWNER FULL NAME"]
 
-    results = df.apply(_check_name_logic, axis=1)
+    results = pd.Series(
+        [_name_logic_core(f, fi, la) for f, fi, la in
+         zip(df["OWNER FULL NAME"], df["OWNER FIRST NAME"], df["OWNER LAST NAME"])],
+        index=df.index,
+    )
 
     case1 = results.apply(lambda x: x is not None and x[0] == 1)
     case2 = results.apply(lambda x: x is not None and x[0] == 2)
@@ -397,17 +495,36 @@ def _filter_name_logic(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     #     • OWNER TYPE in ("Trust", "Company") → legitimate owner, KEEP (not dropped/flagged)
     #     • any other owner type (Individual/Estate/…) → DROP as a Name Logic Issue
     if case3.any():
+        # Rescue for real people whose surname is a road word ("William E Way",
+        # "Jo Ann M Loop"). Runs before the rejection is finalized. Keep the row when
+        # BOTH hold:
+        #   1. OWNER FIRST NAME is present (not blank/NaN), and
+        #   2. lowercase OWNER FIRST NAME equals the lowercase first word of
+        #      OWNER FULL NAME — confirms the name starts with a real given name.
+        # Otherwise the row is rejected exactly as before.
+        first_raw     = df["OWNER FIRST NAME"]
+        first_present = first_raw.notna() & (first_raw.astype(str).str.strip() != "")
+        first_lower   = first_raw.astype(str).str.strip().str.lower()
+        full_first    = (df["OWNER FULL NAME"].astype(str).str.strip()
+                         .str.split().str[0].fillna("").str.lower())
+        case3_rescue  = case3 & first_present & (first_lower == full_first)
+
         if "OWNER TYPE" in df.columns:
-            owner_type = df["OWNER TYPE"].astype(str).str.strip().str.lower()
-            is_entity  = owner_type.isin(["trust", "company"])
-            case3_keep = case3 & is_entity
-            case3_drop = case3 & ~is_entity
+            owner_type   = df["OWNER TYPE"].astype(str).str.strip().str.lower()
+            is_entity    = owner_type.isin(["trust", "company"])
+            case3_keep   = case3 & (is_entity | case3_rescue)
+            case3_drop   = case3 & ~case3_keep
+            rescued_only = case3_rescue & ~is_entity
             print_warn(f"  Case 3 — road keyword in last name: {case3.sum():,} rows "
-                       f"→ {case3_keep.sum():,} Trust/Company kept, {case3_drop.sum():,} dropped.")
+                       f"→ {(case3 & is_entity).sum():,} Trust/Company kept, "
+                       f"{rescued_only.sum():,} rescued (real given name), "
+                       f"{case3_drop.sum():,} dropped.")
             if case3_drop.any():
                 _show_samples(case3_drop, C.PURPLE)
             drop_mask |= case3_drop
         else:
+            # No OWNER TYPE column: previous behavior kept every Case 3 row, so nothing
+            # is dropped here and the rescue is a no-op.
             print_warn(f"  Case 3 — road keyword in last name: {case3.sum():,} rows, "
                        f"but no OWNER TYPE column — keeping all (cannot classify).")
 
@@ -613,6 +730,53 @@ def _correct_preforeclosure(df: pd.DataFrame) -> pd.DataFrame:
         df = _add_flag(df, mask, "preforeclosure_corrected")
         print_step("  Pre-foreclosure correction:")
         print_done(f"    0.8→1 corrected    : {count:,} rows flagged")
+
+    return df
+
+
+# ── Overlap check ──────────────────────────────────────────────────────────────
+
+def _check_overlap(df: pd.DataFrame, cadence: str) -> pd.DataFrame:
+    """Flag-only, cadence-aware check.
+
+    Using the cadence's "Last recommendation" column, count the properties whose
+    last recommendation falls within OVERLAP_DAYS of the run date (day difference
+    from today back to the recommendation date < OVERLAP_DAYS). That share of the
+    file is the overlap. When it exceeds OVERLAP_ALERT_PCT, every overlapping
+    property is flagged ("overlapping") and a console alert is printed.
+
+    A blank/invalid date is treated as non-overlapping; a future date is ignored
+    (not counted). If the cadence column is missing, the check notifies and skips.
+    """
+    col_name = OVERLAP_COLUMNS.get(cadence)
+    col      = find_column(df, [col_name]) if col_name else None
+    if col is None:
+        label = f"'{col_name}'" if col_name else f"cadence '{cadence}'"
+        print_warn(f"  Overlap check skipped — column {label} not found in this file.")
+        return df
+
+    total = len(df)
+    if total == 0:
+        return df
+
+    today = pd.Timestamp.now().normalize()
+    dates = pd.to_datetime(df[col], errors="coerce").dt.normalize()
+    diff  = (today - dates).dt.days
+
+    overlap_mask  = dates.notna() & (diff >= 0) & (diff < OVERLAP_DAYS)
+    overlap_count = int(overlap_mask.sum())
+    pct           = overlap_count / total
+
+    print_step(f"Overlap Check ({col})")
+    print(f"    {overlap_count:,} of {total:,} properties recommended within "
+          f"{OVERLAP_DAYS} days  ({pct*100:.1f}% overlap)")
+
+    if pct > OVERLAP_ALERT_PCT:
+        df = _add_flag(df, overlap_mask, "overlapping")
+        alert = (f"⚠  OVERLAP ALERT: {overlap_count:,} of {total:,} properties "
+                 f"({pct*100:.1f}%) recommended within {OVERLAP_DAYS} days — "
+                 f"exceeds {OVERLAP_ALERT_PCT*100:.0f}% threshold. Properties flagged 'overlapping'.")
+        print(f"  {_color(alert, C.RED)}")
 
     return df
 
@@ -824,6 +988,9 @@ def _process_file(file: Path, output_dir: Path,
         before = len(df); _apply(_filter_institutional_owners, df)
         print_done(f"  Institutional Owners     : {before - len(df):,} removed")
 
+        before = len(df); _apply(_filter_trustee_tokens, df)
+        print_done(f"  Trustee (non-Trust type) : {before - len(df):,} removed")
+
     if "TAGS" in df.columns:
         before = len(df); _apply(_filter_tags, df, cadence)
         print_done(f"  Blacklisted Tags ({cadence.upper():<3})   : {before - len(df):,} removed")
@@ -854,8 +1021,10 @@ def _process_file(file: Path, output_dir: Path,
             print_done(f"  Absentee Same Address    : {before - len(df):,} removed (DM only)")
 
     # ── V-01 Invalid state code ────────────────────────────────────────────────
+    # MAILING STATE is validated for DM only (foreign mailing address disqualifies
+    # a mail row); property STATE is validated on every cadence.
     if "STATE" in df.columns or "MAILING STATE" in df.columns:
-        before = len(df); _apply(_filter_invalid_state, df)
+        before = len(df); _apply(_filter_invalid_state, df, cadence == "dm")
         print_done(f"  Invalid State Code (V-01): {before - len(df):,} removed")
 
     # ── Address validation (flags only, no removal) ────────────────────────────
@@ -866,6 +1035,12 @@ def _process_file(file: Path, output_dir: Path,
 
     # ── Pre-foreclosure correction (all cadences) ──────────────────────────────
     df = _correct_preforeclosure(df)
+
+    # ── Overlap check (flag-only, cadence-aware) ───────────────────────────────
+    try:
+        df = _check_overlap(df, cadence)
+    except Exception as e:
+        print_warn(f"  Overlap check skipped: {e}")
 
     cleaned_rows = len(df)
     print_done(f"\n  Cleaned: {cleaned_rows:,} rows (from {original_rows:,})")
@@ -1033,7 +1208,9 @@ def _save_reports(rejected_all: list[pd.DataFrame],
                     "Count":           1,
                 })
 
-            # Under-represented counties (< threshold of fulfillment) → Flagged
+            # Under-represented counties (< threshold of fulfillment) → Flagged.
+            # Count is 1 per low-coverage county (matching the "Missing county" rows
+            # above), not the number of properties in that county.
             if total > 0:
                 for county, cnt in cr.get("county_counts", {}).items():
                     if cnt / total < COUNTY_LOW_COVERAGE_PCT:
@@ -1042,7 +1219,7 @@ def _save_reports(rejected_all: list[pd.DataFrame],
                             "Total_File_Rows": total_rows,
                             "Status":          "Flagged",
                             "Stage_or_Flag":   "County presence below 5%",
-                            "Count":           int(cnt),
+                            "Count":           1,
                         })
 
         if county_rows:
@@ -1056,8 +1233,9 @@ def _save_reports(rejected_all: list[pd.DataFrame],
         summary = summary[[c for c in col_order if c in summary.columns]]
         summary_path = output_dir / "Rejection_Summary.xlsx"
         if summary_path.exists():
-            existing_summary = pd.read_excel(summary_path, engine="openpyxl")
-            summary = pd.concat([existing_summary, summary], ignore_index=True)
+            existing_summary = read_excel(summary_path)
+            if existing_summary is not None:
+                summary = pd.concat([existing_summary, summary], ignore_index=True)
         save_excel(summary, summary_path)
         n_rej  = summary["Status"].eq("Rejected").sum()
         n_flag = summary["Status"].eq("Flagged").sum()
@@ -1102,13 +1280,14 @@ def _save_reports(rejected_all: list[pd.DataFrame],
                     "OWNER FULL NAME", "OWNER FIRST NAME", "OWNER LAST NAME",
                     "OWNER TYPE", "PROPERTY TYPE",
                     "ADDRESS", "ZIP",
-                    "MAILING ADDRESS", "MAILING ZIP", "FOLIO"]
+                    "MAILING ADDRESS", "MAILING ZIP", "FOLIO", "LINK PROPERTIES"]
         log_cols_present = [c for c in log_cols if c in combined_log.columns]
         run_entry = combined_log[log_cols_present].copy()
 
         if run_log_path.exists():
-            existing = pd.read_excel(run_log_path, engine="openpyxl")
-            run_entry = pd.concat([existing, run_entry], ignore_index=True)
+            existing = read_excel(run_log_path)
+            if existing is not None:
+                run_entry = pd.concat([existing, run_entry], ignore_index=True)
 
         save_excel(run_entry, run_log_path)
         n_rej  = (run_entry["Status"] == "Rejected").sum()

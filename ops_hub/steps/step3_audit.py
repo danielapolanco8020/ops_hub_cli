@@ -8,7 +8,7 @@ from config import (
     AUDIT_OWNER_KEYWORDS, TAGS_BLACKLIST,
 )
 from utils.file_helpers import (
-    get_excel_files, read_excel, save_excel,
+    get_excel_files, read_excel, save_excel, format_k,
     prompt_int, prompt_yes_no,
     print_header, print_step, print_done, print_warn, print_error,
 )
@@ -92,10 +92,53 @@ def _resolve_audit_files(input_dir: Path) -> list[Path]:
     return selected
 
 
-def _audit_file(df: pd.DataFrame, file_path: Path):
+def _check_filename_row_count(df: pd.DataFrame, file_path: Path) -> bool:
+    """
+    New audit filter — verify the file's actual row count matches the 'K' count
+    embedded in its filename.
+
+    The comparison uses the SAME rounding Step 1 uses to name files (format_k), so
+    a file the pipeline named correctly never false-alarms — e.g. a '…5.5K…' file
+    legitimately holds anything that rounds to 5.5K. A real mismatch means the file
+    was edited (rows added/removed) after it was named.
+
+    Returns True on a MISMATCH (caller re-runs Step 1); False when it matches, the
+    filename has no K count, or the file is a multi-sheet split (whose name keeps
+    the pre-split total and would false-alarm — read_excel only loads sheet 1).
+    """
+    if file_path.name.lower().startswith("split_"):
+        print_warn("  Row count vs filename: split file (multi-sheet) — check skipped.")
+        return False
+
+    m = re.search(r'(\d+(?:\.\d+)?)\s*K\b', file_path.name, re.IGNORECASE)
+    if not m:
+        print_warn("  Row count vs filename: no K count in name — check skipped.")
+        return False
+
+    stated_k = float(m.group(1))
+    actual_k = float(format_k(len(df)).rstrip("Kk"))
+
+    if abs(stated_k - actual_k) < 1e-9:
+        _check(f"Row count matches filename (~{format_k(len(df))})", True)
+        return False
+
+    _check("Row count matches filename", False,
+           f"name says {m.group(1)}K but file has {len(df):,} rows (~{format_k(len(df))})")
+    return True
+
+
+def _audit_file(df: pd.DataFrame, file_path: Path) -> bool:
+    """Run all audit checks for one file. Returns True if the filename row-count
+    check failed (caller re-runs Step 1); otherwise falls through to None/False."""
     print(f"\n  File : {file_path.name}")
     print(f"  Rows : {len(df):,}")
     print("  " + "-" * 54)
+
+    # ── New filter — actual file length vs. K count in the filename ─────────────
+    # Runs first: on a mismatch we skip the rest of this file's audit because the
+    # caller will regenerate it by re-running Step 1.
+    if _check_filename_row_count(df, file_path):
+        return True
 
     if {"MAILING ADDRESS", "MAILING ZIP"}.issubset(df.columns):
         dupes = df.duplicated(subset=["MAILING ADDRESS", "MAILING ZIP"], keep=False)
@@ -274,7 +317,15 @@ def run():
         df = read_excel(f)
         if df is None:
             continue
-        _audit_file(df, f)
+        if _audit_file(df, f):
+            print_warn(
+                f"Row count of '{f.name}' does not match the count in its name — "
+                "re-running Step 1 to regenerate the output."
+            )
+            from steps import step1_clean
+            step1_clean.run()
+            print_step("Step 1 finished. Re-run the Audit (Step 3) to verify the regenerated files.")
+            return
 
     print("\n" + "=" * 60)
     print_done("Audit complete.")

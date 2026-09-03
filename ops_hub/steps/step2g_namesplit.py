@@ -3,7 +3,7 @@ from pathlib import Path
 
 from config import OUT_STEP1, OUT_STEP2, CADENCES
 from utils.file_helpers import (
-    get_files_by_cadence, read_excel, save_excel,
+    get_files_by_cadence, read_many_parallel, save_excel,
     prompt_yes_no,
     print_header, print_step, print_done, print_warn, print_error,
     make_output_path,
@@ -32,9 +32,10 @@ def run():
 
     print_step(f"Found {len(files)} file(s)")
 
+    frames_map = read_many_parallel(files)
     for f in files:
         print_step(f"Processing: {f.name}")
-        df = read_excel(f)
+        df = frames_map.get(f)
         if df is None:
             continue
 
