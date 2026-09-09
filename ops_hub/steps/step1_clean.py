@@ -157,6 +157,7 @@ def _filter_institutional_owners(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
     if "OWNER TYPE" in df.columns and mask.any():
         owner_type    = df["OWNER TYPE"].astype(str).str.strip().str.lower()
         is_individual = owner_type == "individual"
+        is_company    = owner_type == "company"
         has_entity    = name.str.contains(_wb_pattern(STRONG_ENTITY_TOKENS), na=False)
 
         # A religious/civic context word (e.g. "St", "Saint", "First", "Holy",
@@ -168,10 +169,23 @@ def _filter_institutional_owners(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
                           if q.lower() not in RESCUE_NAME_EXCEPTIONS]
         has_context    = name.str.contains(_wb_pattern(context_tokens), na=False)
 
-        rescued        = mask & is_individual & ~has_entity & ~has_context
+        rescued_individual = mask & is_individual & ~has_entity & ~has_context
+
+        # ── Company rescue — mirrors the Trustee/Trust rule ────────────────────
+        # A whole-word institutional keyword ("Investments", "Capital", "Holdings"…)
+        # often fires on a legitimate, correctly-typed company. Just as a trustee
+        # token is kept only when OWNER TYPE == 'Trust', an institutional keyword is
+        # overridden when OWNER TYPE == 'Company' AND the name carries a strong
+        # company/entity token (LLC, Inc, Corp, Holdings, …): that is a real company
+        # we still market to, not a mislabeled school/church/utility. A Company-typed
+        # row WITHOUT any entity token (e.g. a bare "Riverside School") stays rejected.
+        rescued_company = mask & is_company & has_entity
+
+        rescued = rescued_individual | rescued_company
         if rescued.any():
-            print_done(f"  Institutional Owner rescue: {rescued.sum():,} 'Individual' "
-                       f"row(s) kept (whole-word keyword, no entity/context token).")
+            print_done(
+                f"  Institutional Owner rescue: {rescued.sum():,} row(s) kept "
+                f"({rescued_individual.sum():,} Individual, {rescued_company.sum():,} Company).")
         mask = mask & ~rescued
 
     rej  = df[mask].copy()
@@ -239,7 +253,10 @@ def _filter_sfh_with_unit(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]
 
 
 def _filter_empty_action_plans(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    mask = df["ACTION PLANS"].notna()
+    # A blank-but-present cell ("" or whitespace) is just as empty as NaN, so strip
+    # and test for emptiness — matching _filter_empty_owner_name. Checking only
+    # notna() would let whitespace-only action plans survive a 360 run.
+    mask = df["ACTION PLANS"].notna() & (df["ACTION PLANS"].astype(str).str.strip() != "")
     rej  = df[~mask].copy()
     rej["Rejection_Stage"] = "Empty Action Plans"
     rej["Rejection_Value"] = ""
@@ -383,6 +400,20 @@ def _initial_matches_full_start(full: str, initial: str) -> bool:
     return False
 
 
+def _last_leads_full(full: str, last: str) -> bool:
+    """Return True when OWNER LAST NAME is the leading run of tokens in
+    OWNER FULL NAME — i.e. a coherent last-name-first record ("Smith W C" → last
+    'Smith', "Reed A Louise" → last 'Reed'). In that layout a single-letter first
+    name is a legitimate middle initial, not a bad mid-name split, so Case 2 should
+    not fire. Genuine junk like "L W" (last 'W', full leads with 'L') still fails
+    this test and stays flagged."""
+    full_tokens = full.lower().split()
+    last_tokens = last.lower().split()
+    if not last_tokens or len(last_tokens) > len(full_tokens):
+        return False
+    return full_tokens[:len(last_tokens)] == last_tokens
+
+
 def _name_logic_core(full_raw, first_raw, last_raw) -> tuple[int, str] | None:
     """Core name-logic check operating on three raw cell values. Called in a tight
     zip() loop by _filter_name_logic (~5x faster than df.apply(axis=1) on large
@@ -400,12 +431,13 @@ def _name_logic_core(full_raw, first_raw, last_raw) -> tuple[int, str] | None:
 
     # Case 2 — First name is a single letter or initial.
     # A leading initial is a coherent split — "R Thomas Navas" → first 'R',
-    # last 'Thomas Navas' — and is left alone. It is only flagged when the initial
-    # is NOT the first character of the full name, which means the initial was
-    # pulled out of the middle and the split is wrong (e.g. "Ellen M Krause"
-    # parsed to first 'M').
+    # last 'Thomas Navas' — and is left alone. A last-name-first record is also
+    # coherent — "Smith W C" → last 'Smith' leads the full name, so the 'W' is a
+    # legitimate middle initial. It is only flagged when NEITHER the initial leads
+    # the full name NOR the last name leads it, which means the split is genuinely
+    # wrong (e.g. "Ellen M Krause" parsed to first 'M', or junk like "L W").
     if re.match(r'^[A-Za-z]\.?$', first):
-        if not _initial_matches_full_start(full, first):
+        if not _initial_matches_full_start(full, first) and not _last_leads_full(full, last):
             return (2, f"Case 2 — Initial '{first}' is not the first name in '{full}'")
 
     # Case 3 — Last name contains road keywords (excluding St)
@@ -504,10 +536,19 @@ def _filter_name_logic(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         # Otherwise the row is rejected exactly as before.
         first_raw     = df["OWNER FIRST NAME"]
         first_present = first_raw.notna() & (first_raw.astype(str).str.strip() != "")
-        first_lower   = first_raw.astype(str).str.strip().str.lower()
-        full_first    = (df["OWNER FULL NAME"].astype(str).str.strip()
-                         .str.split().str[0].fillna("").str.lower())
-        case3_rescue  = case3 & first_present & (first_lower == full_first)
+        # Rescue when a real (2+ letter) word of OWNER FIRST NAME appears ANYWHERE in
+        # OWNER FULL NAME — this confirms a genuine given name is present and covers
+        # BOTH orderings: "Robert B Way" (given name leads) AND "Way Jeremy J"
+        # (surname leads). The previous check only matched the leading token, so
+        # last-first rows like "Way Jeremy J" were wrongly dropped even though
+        # "Jeremy" is clearly a real first name.
+        full_tokens   = df["OWNER FULL NAME"].astype(str).str.lower().str.findall(r"[a-z]{2,}")
+        first_tokens  = first_raw.astype(str).str.lower().str.findall(r"[a-z]{2,}")
+        first_in_full = pd.Series(
+            [bool(set(ft) & set(fut)) for ft, fut in zip(first_tokens, full_tokens)],
+            index=df.index,
+        )
+        case3_rescue  = case3 & first_present & first_in_full
 
         if "OWNER TYPE" in df.columns:
             owner_type   = df["OWNER TYPE"].astype(str).str.strip().str.lower()
@@ -924,6 +965,15 @@ def _process_file(file: Path, output_dir: Path,
         df["MAILING ADDRESS"] = df["MAILING ADDRESS"].fillna(df["ADDRESS"])
     if "MAILING ZIP" in df.columns and "ZIP" in df.columns:
         df["MAILING ZIP"] = df["MAILING ZIP"].fillna(df["ZIP"])
+
+    # ── Coerce ABSENTEE to numeric early ───────────────────────────────────────
+    # Downstream absentee logic — the DM same-address block below and
+    # _correct_absentee — compares ABSENTEE against numbers. A file that delivers
+    # it as text would raise a TypeError on `>= 1`, failing the whole file. Coerce
+    # once here so every later comparison is safe; blanks/junk become NaN (which
+    # _correct_absentee already treats as null).
+    if "ABSENTEE" in df.columns:
+        df["ABSENTEE"] = pd.to_numeric(df["ABSENTEE"], errors="coerce")
 
     # ── Fix LINK PROPERTIES ────────────────────────────────────────────────────
     df = _fix_link_properties(df)
