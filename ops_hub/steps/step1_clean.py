@@ -544,8 +544,15 @@ def _filter_name_logic(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         # "Jeremy" is clearly a real first name.
         full_tokens   = df["OWNER FULL NAME"].astype(str).str.lower().str.findall(r"[a-z]{2,}")
         first_tokens  = first_raw.astype(str).str.lower().str.findall(r"[a-z]{2,}")
+        # str.findall returns a list per string cell but a scalar NaN for any NA cell.
+        # On pandas 3.0 the new default string dtype keeps blanks as NA through
+        # astype(str) (2.x turned them into the literal "nan"), so NA reaches findall
+        # and comes back as a float. Guard with _tokset so a non-list never reaches
+        # set(), which would raise "TypeError: 'float' object is not iterable".
+        def _tokset(v):
+            return set(v) if isinstance(v, list) else set()
         first_in_full = pd.Series(
-            [bool(set(ft) & set(fut)) for ft, fut in zip(first_tokens, full_tokens)],
+            [bool(_tokset(ft) & _tokset(fut)) for ft, fut in zip(first_tokens, full_tokens)],
             index=df.index,
         )
         case3_rescue  = case3 & first_present & first_in_full
