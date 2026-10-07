@@ -172,6 +172,29 @@ def _fix_zip_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _strip_whitespace(df: pd.DataFrame) -> pd.DataFrame:
+    """Trim leading/trailing whitespace from every string cell, in place.
+
+    Applied centrally on read so the whole pipeline and all outputs are clean:
+    stray spaces (e.g. ' 123 Main St') otherwise survive into deliverables and
+    quietly break exact-match logic — address == mailing address, dedup keys,
+    and provider exports. Only genuine string cells are touched; numbers, dates
+    and NaN are left exactly as-is, so dtypes and missing values are preserved.
+
+    We try `.str.strip()` on every column and skip the ones that don't support it
+    rather than gating on a dtype name: depending on the read engine a text column
+    can come back as 'object' OR the newer 'str'/'string' dtype, and a plain
+    `== object` check silently misses the latter.
+    """
+    for col in df.columns:
+        try:
+            stripped = df[col].str.strip()            # NaN for non-string cells
+        except (AttributeError, TypeError):
+            continue                                   # not a string column — skip
+        df[col] = stripped.where(stripped.notna(), df[col])  # keep non-string originals
+    return df
+
+
 # ── Excel engine resolution (single source of truth) ────────────────────────────
 # I/O CONVENTION — keep every step (current and future) consistent:
 #   • READ  xlsx via  read_excel()  /  read_many_parallel()   — never pd.read_excel
@@ -216,10 +239,81 @@ def read_excel(path: Path) -> pd.DataFrame | None:
     engine = _resolve_read_engine()
     try:
         df = pd.read_excel(path, engine=engine)
+        df = _strip_whitespace(df)      # trim stray spaces before anything else reads it
         return _fix_zip_columns(df)
     except Exception as e:
         print(f"  [ERROR] Could not read {path.name}: {e}")
         return None
+
+
+def detect_formula_and_hidden(path: Path, sheet: "str | int" = 0) -> "tuple[dict[str, int], list[str]]":
+    """Single-pass data-integrity check. Returns (formula_columns, hidden_columns):
+
+      formula_columns : {header: formula_cell_count} for columns whose body cells
+                        hold Excel formulas (e.g. '=A1*2') instead of literal values.
+      hidden_columns  : [header, ...] for columns hidden in the sheet.
+
+    Both facts matter because the pipeline reads via config.READ_ENGINE
+    ("calamine"), which only ever sees a formula's CACHED value and nothing about
+    hidden state — so stale/zero formula results and invisible data columns would
+    slip through silently. They live in the workbook structure (cell types +
+    column metadata), which openpyxl only exposes on a FULL load — read_only
+    streaming does not populate column_dimensions. So this does ONE
+    load_workbook(data_only=False) and derives BOTH results from it rather than
+    opening the file twice. Headerless columns are reported by their spreadsheet
+    letter (e.g. "column H"); on any read error it returns ({}, []).
+    """
+    from openpyxl import load_workbook
+    from openpyxl.utils import get_column_letter
+
+    wb = load_workbook(path, read_only=False, data_only=False)
+    try:
+        ws = wb[sheet] if isinstance(sheet, str) else wb.worksheets[sheet]
+
+        # Column index -> header name (row 1).
+        try:
+            headers = {cell.column: cell.value for cell in ws[1]}
+        except (IndexError, TypeError):
+            headers = {}
+
+        def _name(idx: int) -> str:
+            val = headers.get(idx)
+            return str(val) if val not in (None, "") else f"column {get_column_letter(idx)}"
+
+        # Formulas — scan body rows only (row 1 is the header).
+        formula_counts: dict[str, int] = {}
+        for row in ws.iter_rows(min_row=2):
+            for cell in row:
+                val = cell.value
+                if cell.data_type == "f" or (isinstance(val, str) and val.startswith("=")):
+                    name = _name(cell.column)
+                    formula_counts[name] = formula_counts.get(name, 0) + 1
+
+        # Hidden columns — from column metadata (handles min..max ranges).
+        hidden: list[str] = []
+        for dim in ws.column_dimensions.values():
+            if dim.hidden:
+                for idx in range(dim.min, dim.max + 1):
+                    hidden.append(_name(idx))
+
+        return formula_counts, hidden
+    except Exception as e:
+        print(f"  [WARN] Integrity check could not read {path.name}: {e}")
+        return {}, []
+    finally:
+        wb.close()
+
+
+def detect_formula_columns(path: Path, sheet: "str | int" = 0) -> "dict[str, int]":
+    """Columns containing Excel formulas: {header: formula_cell_count}. Thin
+    wrapper over the single-pass detect_formula_and_hidden()."""
+    return detect_formula_and_hidden(path, sheet)[0]
+
+
+def detect_hidden_columns(path: Path, sheet: "str | int" = 0) -> "list[str]":
+    """Header names of columns hidden in the sheet. Thin wrapper over the
+    single-pass detect_formula_and_hidden()."""
+    return detect_formula_and_hidden(path, sheet)[1]
 
 
 def read_many_parallel(paths: list[Path], max_workers: int | None = None) -> "dict[Path, pd.DataFrame | None]":
