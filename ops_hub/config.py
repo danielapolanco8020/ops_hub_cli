@@ -231,6 +231,21 @@ TRUSTEE_TOKENS = [
     "trustee", "trustees", "co-trustee", "ttee", "trs", "successor trustee",
 ]
 
+# The bare word "trust" (vs. "trustee") — e.g. "Smith Family Trust", "John Doe
+# Revocable Trust" — likewise means the property is held in trust and follows the
+# SAME rule: kept only when OWNER TYPE == 'Trust', dropped otherwise. Matched as a
+# whole word, so it never fires inside "trustee" (that is handled above). Kept in a
+# separate list so the rejection report can distinguish a bare-trust name from a
+# trustee token.
+TRUST_NAME_TOKENS = ["trust"]
+
+# ── Company owner-type rules ──────────────────────────────────────────────────
+# "Estate of" / "Est of" inside a NAME column means an estate-owned property that
+# was mis-typed as Company. Matched as whole phrases (word-boundary aware via
+# _wb_pattern), so "real estate offer" or "best of" never fire; the period variants
+# cover "Est. of" / "Estate. of".
+ESTATE_OF_TOKENS = ["estate of", "est of", "estate. of", "est. of"]
+
 TAGS_BLACKLIST = [
     "Liti", "DNC", "donotmail", "Takeoff", "Undeli", "Return", "Dead",
     "Do Not Mail", "Dono", "Do no", "Available"
@@ -290,6 +305,14 @@ OVERLAP_COLUMNS   = {
     "cc":  "Last recommendation CC",
     "sms": "Last recommendation SMS",
 }
+
+# ── Sticker Price Check (DM only) ─────────────────────────────────────────────
+# The "sticker price" is the cash-offer figure printed on the direct-mail postcard.
+# DM files should carry a numeric value here; the check reports what share of rows
+# do, and raises a console alert when fewer than STICKER_PRICE_MIN_PCT are numeric.
+# The column is resolved by the first name found in STICKER_PRICE_COLUMNS.
+STICKER_PRICE_COLUMNS = ["STICKER PRICE", "ESTIMATED CASH OFFER", "CASH OFFER", "OFFER PRICE"]
+STICKER_PRICE_MIN_PCT = 0.90
 
 # ── Audit Step ────────────────────────────────────────────────────────────────
 AUDIT_URGENT_PLAN      = "30 DAYS"
