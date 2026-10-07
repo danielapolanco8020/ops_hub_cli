@@ -5,11 +5,11 @@ from pathlib import Path
 from config import (
     AUDIT_URGENT_PLAN, AUDIT_HIGH_PLAN,
     AUDIT_URGENT_MIN_SCORE, AUDIT_HIGH_MIN_SCORE,
-    AUDIT_OWNER_KEYWORDS, TAGS_BLACKLIST,
+    AUDIT_OWNER_KEYWORDS, TAGS_BLACKLIST, VALID_MAILING_PATTERNS,
 )
 from utils.file_helpers import (
     get_excel_files, read_excel, save_excel, format_k,
-    prompt_int, prompt_yes_no,
+    prompt_int, prompt_yes_no, detect_formula_and_hidden,
     print_header, print_step, print_done, print_warn, print_error,
 )
 
@@ -140,6 +140,37 @@ def _audit_file(df: pd.DataFrame, file_path: Path) -> bool:
     if _check_filename_row_count(df, file_path):
         return True
 
+    # ── Integrity confirmation review (formulas + hidden columns) ───────────────
+    # The data is read via calamine, which only sees a formula's cached value and
+    # nothing about hidden state, so both are data-integrity risks. One openpyxl
+    # pass detects both. PASS = clean; FAIL names the offending columns so the
+    # file can be fixed (convert formulas to values / unhide and review).
+    formulas, hidden = detect_formula_and_hidden(file_path)
+    if formulas:
+        cols = ", ".join(f"{c} ({n:,})" for c, n in formulas.items())
+        _check("No formulas in file", False,
+               f"{len(formulas)} column(s) contain formulas: {cols}")
+    else:
+        _check("No formulas in file", True)
+
+    if hidden:
+        _check("No hidden columns in file", False,
+               f"{len(hidden)} hidden column(s): {', '.join(hidden)}")
+    else:
+        _check("No hidden columns in file", True)
+
+    # ── PO Box property-address review ──────────────────────────────────────────
+    # Mailing-only formats (PO Box, Rural Route, HC/HCR, PSC/Unit/CMO, General
+    # Delivery) are not valid PROPERTY addresses (they remain fine for MAILING
+    # ADDRESS). PASS = none present in the ADDRESS column.
+    if "ADDRESS" in df.columns:
+        addr = df["ADDRESS"].astype(str).str.strip()
+        pobox_mask = addr.apply(lambda s: bool(s) and any(
+            re.match(p, s, re.IGNORECASE) for p in VALID_MAILING_PATTERNS))
+        n_pobox = int(pobox_mask.sum())
+        _check("No PO Box / mailing-only property addresses", n_pobox == 0,
+               f"{n_pobox:,} property address(es) in a mailing-only format" if n_pobox else "")
+
     if {"MAILING ADDRESS", "MAILING ZIP"}.issubset(df.columns):
         dupes = df.duplicated(subset=["MAILING ADDRESS", "MAILING ZIP"], keep=False)
         _check("Duplicates (Mailing Address + ZIP)", not dupes.any(),
@@ -229,7 +260,9 @@ def _audit_file(df: pd.DataFrame, file_path: Path) -> bool:
         phone_type_cols = [c for c in phone_type_cols if df[c].notna().any()]
         phone_num_cols  = [c for c in phone_num_cols  if df[c].notna().any()]
         all_phone_cols  = phone_type_cols + phone_num_cols
-        keywords        = "void|null|failed" + ("|landline" if is_sms else "")
+        # Invalid phone types for CC and SMS: void/null/failed/dnc. SMS also
+        # treats landline as invalid (can't text a landline).
+        keywords        = "void|null|failed|dnc" + ("|landline" if is_sms else "")
 
         for col in phone_type_cols:
             # Convert to string only for keyword matching, don't modify original df
