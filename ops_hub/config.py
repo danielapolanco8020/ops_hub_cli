@@ -310,8 +310,8 @@ OVERLAP_COLUMNS   = {
 # The "sticker price" is the cash-offer figure printed on the direct-mail postcard.
 # DM files should carry a numeric value here; the check reports what share of rows
 # do, and raises a console alert when fewer than STICKER_PRICE_MIN_PCT are numeric.
-# The column is resolved by the first name found in STICKER_PRICE_COLUMNS.
-STICKER_PRICE_COLUMNS = ["STICKER PRICE", "ESTIMATED CASH OFFER", "CASH OFFER", "OFFER PRICE"]
+# The check uses the "STICKER PRICE" column only — no fallback candidates.
+STICKER_PRICE_COLUMNS = ["STICKER PRICE"]
 STICKER_PRICE_MIN_PCT = 0.90
 
 # ── Audit Step ────────────────────────────────────────────────────────────────
