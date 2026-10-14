@@ -1,5 +1,4 @@
 import warnings
-import numpy as np
 import pandas as pd
 from pathlib import Path
 
@@ -217,9 +216,14 @@ def _split_6_action_plan(df):
 
 
 def _split_7_weekly(df):
-    weeks  = prompt_int("  Number of weeks to split into", SPLIT_DEFAULT_WEEKS, 2, 52)
-    chunks = np.array_split(df, weeks)
-    return {f"week_{i+1}": chunk for i, chunk in enumerate(chunks)}
+    _validate(df, ["FOLIO", "ACTION PLANS", "PROPERTY TYPE"], "Weekly")
+    weeks = prompt_int("  Number of weeks to split into", SPLIT_DEFAULT_WEEKS, 2, 52)
+    # Each week gets an equal share = 100 / weeks, distributed with the SAME
+    # balanced logic as the proportional split (_split_balanced, unchanged), so
+    # every week is a representative sample across ACTION PLANS.
+    proportions = [(f"week_{i+1}", 100.0 / weeks) for i in range(weeks)]
+    print(f"\n  Splitting into {weeks} weeks ({100.0/weeks:.1f}% each):")
+    return _split_balanced(df, proportions)
 
 
 def _parse_groups(valid_values: list, label: str) -> list[tuple[str, list]]:

@@ -346,32 +346,6 @@ def _filter_company_estate_of(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFr
     return df[~drop_mask], rej
 
 
-# Secondary unit / apartment designators. "#" is matched on its own (it is not a
-# word character); the rest are matched as whole words so "Fl" won't hit a street
-# name and "Lot" won't hit part of a word.
-SFH_UNIT_PATTERN = re.compile(
-    r"(?i)(?:#|\b(?:unit|apt|apartment|ste|suite|bldg|building|rm|room|"
-    r"spc|space|trlr|trailer|lot|dept|fl|floor)\b)"
-)
-
-
-def _filter_sfh_with_unit(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """A single-family home (PROPERTY TYPE == "SFH") should not carry a unit or
-    apartment designator in its address — such a row is usually a duplex or
-    apartment mislabeled as SFH. Drop those rows."""
-    if not {"PROPERTY TYPE", "ADDRESS"}.issubset(df.columns):
-        return df, pd.DataFrame()
-
-    is_sfh   = df["PROPERTY TYPE"].astype(str).str.strip().str.lower() == "sfh"
-    has_unit = df["ADDRESS"].astype(str).str.contains(SFH_UNIT_PATTERN, na=False)
-    mask     = is_sfh & has_unit
-
-    rej = df[mask].copy()
-    rej["Rejection_Stage"] = "SFH With Unit Number"
-    rej["Rejection_Value"] = rej["ADDRESS"]
-    return df[~mask], rej
-
-
 # Street *prefix* words that must be followed by an actual street name. In these
 # (mostly Spanish/Italian) formats the type word leads the street — "Via Del Mar",
 # "Calle Ocho", "Camino Real" — so a house number followed by only the bare prefix
@@ -1579,10 +1553,6 @@ def _process_file(file: Path, output_dir: Path,
     if cadence in ("cc", "sms"):
         before = len(df); _apply(_filter_invalid_phone_types, df, cadence)
         print_done(f"  Invalid Phone Type       : {before - len(df):,} removed")
-
-    if {"PROPERTY TYPE", "ADDRESS"}.issubset(df.columns):
-        before = len(df); _apply(_filter_sfh_with_unit, df)
-        print_done(f"  SFH With Unit Number     : {before - len(df):,} removed")
 
     if "ADDRESS" in df.columns:
         before = len(df); _apply(_filter_street_prefix_only, df)
