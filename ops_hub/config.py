@@ -136,6 +136,20 @@ REQUIRED_COLUMNS = {
     ],
 }
 
+# ── Binary indicator columns ──────────────────────────────────────────────────
+# These distress/attribute columns may ONLY hold 0 or 1 (blank = missing, allowed).
+# A non-blank value other than 0/1 is a data error and the row is rejected in Step 1.
+# Deliberately EXCLUDED:
+#   • ABSENTEE        — legitimately uses 0/1/2 (see _correct_absentee)
+#   • PRE-FORECLOSURE — has its own rule (0.8→1, else reject; see _correct_preforeclosure)
+BINARY_FLAG_COLUMNS = [
+    "HIDDENGEMS", "HIGH EQUITY", "DOWNSIZING", "VACANT", "55+", "ESTATE",
+    "INTER FAMILY TRANSFER", "DIVORCE", "TAXES", "PROBATE", "LOW CREDIT",
+    "CODE VIOLATIONS", "BANKRUPTCY", "LIENS CITY/COUNTY", "LIENS OTHER",
+    "LIENS UTILITY", "LIENS HOA", "LIENS MECHANIC", "POOR CONDITION",
+    "EVICTION", "30-60 DAYS", "JUDGEMENT", "DEBT COLLECTION", "DEFAULT RISK",
+]
+
 # ── Clean Step ────────────────────────────────────────────────────────────────
 UNWANTED_NAMES = [
     "Given Not", "Record", "Available", "Bank ", "Church ", "School", "Cemetery",
@@ -313,6 +327,18 @@ OVERLAP_COLUMNS   = {
 # The check uses the "STICKER PRICE" column only — no fallback candidates.
 STICKER_PRICE_COLUMNS = ["STICKER PRICE"]
 STICKER_PRICE_MIN_PCT = 0.90
+
+# ── Action Plan Distribution Check ────────────────────────────────────────────
+# Target share of each ACTION PLANS value in the delivered (post-trim) file.
+# Urgent = 30-day frequency, High-Priority = 60-day, Standard = 90-day.
+# A plan whose share is more than ACTION_PLAN_TOLERANCE away (absolute percentage
+# points, e.g. 9.84% ± 2 → 7.84%–11.84%) flags the file in the rejection log/summary.
+ACTION_PLAN_TARGET_DISTRIBUTION = {
+    "30 DAYS": 0.0984,   # Urgent
+    "60 DAYS": 0.2438,   # High-Priority
+    "90 DAYS": 0.6578,   # Standard
+}
+ACTION_PLAN_TOLERANCE = 0.02
 
 # ── Audit Step ────────────────────────────────────────────────────────────────
 AUDIT_URGENT_PLAN      = "30 DAYS"
