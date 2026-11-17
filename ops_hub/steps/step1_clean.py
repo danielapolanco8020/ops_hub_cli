@@ -18,6 +18,8 @@ from config import (
     USPS_STATES, COUNTY_MASTER_LOCAL,
     OVERLAP_DAYS, OVERLAP_ALERT_PCT, OVERLAP_COLUMNS,
     STICKER_PRICE_COLUMNS, STICKER_PRICE_MIN_PCT,
+    ACTION_PLAN_TARGET_DISTRIBUTION, ACTION_PLAN_TOLERANCE,
+    BINARY_FLAG_COLUMNS,
 )
 from utils.file_helpers import (
     get_excel_files, read_excel, save_excel, find_column,
@@ -114,6 +116,145 @@ def _filter_unwanted_names(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame
     rej["Rejection_Stage"] = "Unwanted Names"
     rej["Rejection_Value"] = rej["OWNER FULL NAME"]
     return df[~mask], rej
+
+
+# Name fields checked for numeric characters. The rule depends on OWNER TYPE:
+#   • Individual / blank / no OWNER TYPE column → any digit rejects the row, except an
+#     ordinal suffix ("Gregory 2nd", "Paul E 3rd" are generational, not typos).
+#   • Company / Trust / Estate → digits are normal in entity names ("Baran 2006 Rev
+#     Trust", "3900 Nw 23rd Llc", "Cl South 3 Llc", "Cruz Family Trust /22"), so the
+#     row is rejected ONLY when a digit stands in for a letter inside a word
+#     ("Mathew 4ndrews Llc", "J0hn R Russo", "Rev0cable Trust") — see _digit_typo_tokens.
+NAME_COLUMNS_NO_DIGITS = ["OWNER FULL NAME", "OWNER FIRST NAME", "OWNER LAST NAME"]
+_DIGIT_RE          = re.compile(r"\d")
+_ORDINAL_RE        = re.compile(r"(?i)\b\d+(?:st|nd|rd|th)\b")
+_NAME_TOKEN_RE     = re.compile(r"[A-Za-z0-9]+")
+_TRAILING_ENTITY_NO = re.compile(r"(?i)[a-z]+[1-9]")   # Holdings1, Trust2, Group3 = numbered entity
+_ENTITY_OWNER_TYPES = {"company", "trust", "estate"}
+# Digit → the letter(s) it is mistaken for. A digit is also tried as a stray insertion
+# (deleted), which catches 'Paul0' → 'paul'.
+_DIGIT_LOOKALIKES  = {"0": "o", "1": "il", "2": "z", "3": "e", "4": "a",
+                      "5": "s", "6": "g", "7": "t", "8": "b", "9": "g"}
+_VOCAB_MIN_COUNT   = 3   # a word must appear this often in the file's clean names to count
+# Standing list of known name words (one per line, '#' = comment), built from past
+# runs' owner names. Lets the check recognise a surname that is rare in the current
+# file ('4ndrews' -> 'andrews'). Optional: without it only the file's own names are used.
+NAME_VOCAB_FILE    = Path(__file__).resolve().parent.parent / "name_vocab.txt"
+_STANDING_VOCAB: set[str] | None = None
+
+
+def _load_standing_vocab() -> set[str]:
+    global _STANDING_VOCAB
+    if _STANDING_VOCAB is None:
+        _STANDING_VOCAB = set()
+        if NAME_VOCAB_FILE.exists():
+            for line in NAME_VOCAB_FILE.read_text(encoding="utf-8").splitlines():
+                w = line.strip().lower()
+                if w and not w.startswith("#"):
+                    _STANDING_VOCAB.add(w)
+    return _STANDING_VOCAB
+
+
+def _build_name_vocab(df: pd.DataFrame, cols: list[str]) -> set[str]:
+    """Known name words: the standing list in NAME_VOCAB_FILE, plus words learned from
+    the file itself (lower-cased alphabetic words of 3+ letters from every digit-free
+    name cell, seen at least _VOCAB_MIN_COUNT times), plus the common first/last
+    name lists."""
+    from utils.name_helpers import COMMON_FIRST_NAMES, COMMON_LAST_NAMES
+    counts = Counter()
+    for c in cols:
+        s = df[c].dropna().astype(str)
+        for value in s[~s.str.contains(_DIGIT_RE, na=False)]:
+            counts.update(re.findall(r"[a-z]{3,}", value.lower()))
+    vocab = {w for w, n in counts.items() if n >= _VOCAB_MIN_COUNT}
+    vocab |= {n.lower() for n in COMMON_FIRST_NAMES | COMMON_LAST_NAMES}
+    vocab |= _load_standing_vocab()
+    return vocab
+
+
+def _digit_typo_tokens(value: str, vocab: set[str]) -> list[str]:
+    """Words in an entity name where a single digit replaces a letter, returned as
+    'token->fix'. A word qualifies only when it mixes letters and exactly one digit,
+    has 3+ letters, is not an ordinal or a trailing entity number (Holdings1), is not
+    itself a known word, and swapping the digit for its look-alike letter (or deleting
+    it) yields a known name word of 4+ letters. Pure numbers (2017, 3900, /22) and
+    short codes (M1, D3, 24hr) are never touched."""
+    hits = []
+    for tok in _NAME_TOKEN_RE.findall(value):
+        low = tok.lower()
+        digits = _DIGIT_RE.findall(low)
+        if len(digits) != 1 or not re.search(r"[a-z]", low):
+            continue
+        if _ORDINAL_RE.fullmatch(low) or _TRAILING_ENTITY_NO.fullmatch(low):
+            continue
+        if len(low) - 1 < 3 or low in vocab:
+            continue
+        i = _DIGIT_RE.search(low).start()
+        candidates = [low[:i] + ch + low[i + 1:] for ch in _DIGIT_LOOKALIKES[low[i]]]
+        if i > 0:   # a leading digit is a word ('2tech', '4ever'), so only a look-alike counts there
+            candidates.append(low[:i] + low[i + 1:])
+        fix = next((c for c in candidates if len(c) >= 4 and c in vocab), None)
+        if fix:
+            hits.append(f"{tok}->{fix}")
+    return hits
+
+
+def _filter_numeric_in_name(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Reject rows with a numeric character in OWNER FULL/FIRST/LAST NAME, using the
+    owner-type-aware rule described above NAME_COLUMNS_NO_DIGITS. Blank / NaN cells
+    are ignored. A row failing on more than one field lists every offending
+    COLUMN=value in Rejection_Value; entity typos also show the detected fix, e.g.
+    'OWNER FULL NAME=Mathew 4ndrews Llc (4ndrews->andrews)'."""
+    cols = [c for c in NAME_COLUMNS_NO_DIGITS if c in df.columns]
+    if not cols:
+        return df, pd.DataFrame()
+
+    if "OWNER TYPE" in df.columns:
+        is_entity = df["OWNER TYPE"].astype(str).str.strip().str.lower().isin(_ENTITY_OWNER_TYPES)
+    else:
+        is_entity = pd.Series(False, index=df.index)
+
+    vocab   = _build_name_vocab(df, cols) if is_entity.any() else set()
+    bad     = pd.Series(False, index=df.index)
+    reasons = pd.Series("", index=df.index)
+
+    for c in cols:
+        s         = df[c].astype(str).str.strip()
+        has_digit = df[c].notna() & s.str.contains(_DIGIT_RE, na=False)
+        if not has_digit.any():
+            continue
+
+        # Individuals / blank owner type: any digit outside an ordinal suffix.
+        ind_rows = has_digit & ~is_entity
+        ind_bad  = ind_rows & s.str.replace(_ORDINAL_RE, "", regex=True).str.contains(_DIGIT_RE, na=False)
+        piece    = (c + "=" + s).where(ind_bad, "")
+
+        # Entities: only a digit-for-letter typo inside a word.
+        ent_rows = has_digit & is_entity
+        if ent_rows.any():
+            typos   = s[ent_rows].map(lambda v: _digit_typo_tokens(v, vocab))
+            ent_bad = pd.Series(False, index=df.index)
+            ent_bad.loc[typos.index] = typos.str.len() > 0
+            if ent_bad.any():
+                piece.loc[ent_bad] = (c + "=" + s[ent_bad] + " ("
+                                      + typos[ent_bad[ent_rows]].str.join(", ") + ")")
+        else:
+            ent_bad = pd.Series(False, index=df.index)
+
+        col_bad = ind_bad | ent_bad
+        if not col_bad.any():
+            continue
+        bad |= col_bad
+        current = reasons[col_bad]
+        reasons.loc[col_bad] = current.where(current.eq(""), current + "; ") + piece[col_bad]
+
+    if not bad.any():
+        return df, pd.DataFrame()
+
+    rej = df[bad].copy()
+    rej["Rejection_Stage"] = "Numeric Character in Name"
+    rej["Rejection_Value"] = reasons[bad]
+    return df[~bad], rej
 
 
 # Vowels that make a name pronounceable. 'y' is included so real surnames whose
@@ -999,49 +1140,174 @@ def _correct_absentee(df: pd.DataFrame) -> pd.DataFrame:
 
 # ── Pre-foreclosure correction ─────────────────────────────────────────────────
 
-def _correct_preforeclosure(df: pd.DataFrame) -> pd.DataFrame:
+def _correct_preforeclosure(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Pre-foreclosure has two rules in one pass:
+      1) REJECT any non-blank value other than 0, 0.8 or 1 (e.g. 0.5, 2, junk text).
+         Invalidity is computed from the RAW cell before numeric coercion, so junk
+         strings (which coerce to NaN) are caught as invalid rather than mistaken for
+         a blank. A truly blank / missing cell is left alone.
+      2) On the surviving rows, convert 0.8 → 1 (the historical normalization)."""
     if "PRE-FORECLOSURE" not in df.columns:
-        return df
+        return df, pd.DataFrame()
 
+    raw      = df["PRE-FORECLOSURE"]
+    is_blank = raw.isna() | raw.astype(str).str.strip().str.lower().isin(["", "nan", "none"])
+    num      = pd.to_numeric(raw, errors="coerce")
+
+    # 1) Reject non-blank, non-allowed values.
+    invalid = ~is_blank & ~num.isin([0, 0.8, 1])
+    rej     = df[invalid].copy()
+    if not rej.empty:
+        rej["Rejection_Stage"] = "Invalid Pre-Foreclosure Value (not 0/0.8/1)"
+        rej["Rejection_Value"] = "PRE-FORECLOSURE=" + raw[invalid].astype(str).str.strip()
+    df = df[~invalid].copy()
+
+    # 2) Persist numeric form on survivors, then convert 0.8 → 1.
     df["PRE-FORECLOSURE"] = pd.to_numeric(df["PRE-FORECLOSURE"], errors="coerce")
-    vals = df["PRE-FORECLOSURE"]
-
-    # 1) Validate FIRST, before any conversion: the only allowed values are
-    #    0, 0.8 and 1. Flag any other non-blank value (e.g. 0.5, 0.9, 2). A
-    #    blank / non-numeric cell coerces to NaN and is treated as missing, not
-    #    invalid, so it is left alone.
-    invalid   = vals.notna() & ~vals.isin([0, 0.8, 1])
-    inv_count = int(invalid.sum())
-    if inv_count:
-        df = _add_flag(df, invalid, "preforeclosure_invalid_value")
-
-    # 2) THEN convert 0.8 → 1 (the historical normalization). Valid 0.8 rows are
-    #    not flagged by step 1, so the two rules coexist in one pass.
     mask  = df["PRE-FORECLOSURE"] == 0.8
     count = int(mask.sum())
     if count:
         df.loc[mask, "PRE-FORECLOSURE"] = 1
         df = _add_flag(df, mask, "preforeclosure_corrected")
 
-    if inv_count or count:
+    if len(rej) or count:
         print_step("  Pre-foreclosure:")
-        if inv_count:
-            print_warn(f"    Invalid value (not 0/0.8/1): {inv_count:,} rows flagged")
+        if len(rej):
+            print_warn(f"    Invalid value (not 0/0.8/1): {len(rej):,} rows rejected")
         if count:
             print_done(f"    0.8→1 corrected            : {count:,} rows flagged")
 
-    return df
+    return df, rej
+
+
+# ── Binary indicator columns must be 0 or 1 ──────────────────────────────────────
+
+def _filter_invalid_binary_values(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Reject rows where any binary indicator column (config.BINARY_FLAG_COLUMNS)
+    holds a non-blank value other than 0 or 1. Blank / missing cells are left alone.
+    ABSENTEE (0/1/2) and PRE-FORECLOSURE (own 0/0.8/1 rule) are intentionally NOT in
+    BINARY_FLAG_COLUMNS and are handled by their own correctors. A row failing on more
+    than one column lists every offending COLUMN=value in Rejection_Value."""
+    cols = [c for c in BINARY_FLAG_COLUMNS if c in df.columns]
+    if not cols:
+        return df, pd.DataFrame()
+
+    bad     = pd.Series(False, index=df.index)
+    reasons = pd.Series("", index=df.index)
+
+    for c in cols:
+        raw      = df[c]
+        is_blank = raw.isna() | raw.astype(str).str.strip().str.lower().isin(["", "nan", "none"])
+        num      = pd.to_numeric(raw, errors="coerce")
+        invalid  = ~is_blank & ~num.isin([0, 1])
+        if not invalid.any():
+            continue
+        bad |= invalid
+        piece   = c + "=" + raw[invalid].astype(str).str.strip()
+        current = reasons[invalid]
+        reasons.loc[invalid] = current.where(current.eq(""), current + "; ") + piece
+
+    if not bad.any():
+        return df, pd.DataFrame()
+
+    rej = df[bad].copy()
+    rej["Rejection_Stage"] = "Invalid Binary Value (not 0/1)"
+    rej["Rejection_Value"] = reasons[bad]
+    return df[~bad], rej
+
+
+# ── Trim breakdown by ACTION PLANS ──────────────────────────────────────────────
+
+def _print_trim_by_action_plan(before: pd.DataFrame, after: pd.DataFrame) -> None:
+    """After the goal trim, print how many rows were deleted for each ACTION PLANS
+    value (blank plans shown as '(blank)'), with the before → after count per plan.
+    No-op when the file has no ACTION PLANS column."""
+    if "ACTION PLANS" not in before.columns:
+        return
+
+    def _counts(frame: pd.DataFrame) -> pd.Series:
+        plans = frame["ACTION PLANS"].fillna("").astype(str).str.strip()
+        return plans.replace("", "(blank)").value_counts()
+
+    b, a    = _counts(before), _counts(after)
+    a       = a.reindex(b.index, fill_value=0)
+    removed = (b - a).sort_values(ascending=False)
+    total   = int(removed.sum())
+
+    print(f"    {_color('Rows deleted by trim, per ACTION PLANS value:', C.BLUE)}")
+    width = max(len(p) for p in removed.index)
+    for plan, n in removed.items():
+        line = f"      {plan:<{width}} : {int(n):>7,} deleted  ({int(b[plan]):,} → {int(a[plan]):,})"
+        print(_color(line, C.RED) if n else line)
+    print(f"      {'TOTAL':<{width}} : {total:>7,} deleted")
+
+
+# ── Action plan distribution check (post-trim, file level) ──────────────────────
+
+AP_DISTRIBUTION_FLAG = "Action plan distribution off target"
+
+
+def _check_action_plan_distribution(df: pd.DataFrame) -> dict | None:
+    """Compare each ACTION PLANS value's share of the delivered file against
+    ACTION_PLAN_TARGET_DISTRIBUTION (± ACTION_PLAN_TOLERANCE, absolute percentage
+    points). Shares use ALL rows as the denominator, so blank / unexpected plans
+    count against the targets. Always prints the breakdown; returns a dict with the
+    out-of-tolerance plans when the file misses the targets, else None. Skipped when
+    the file has no ACTION PLANS column or every plan is blank."""
+    if "ACTION PLANS" not in df.columns or df.empty:
+        return None
+    plans = df["ACTION PLANS"].fillna("").astype(str).str.strip().str.upper()
+    if plans.eq("").all():
+        return None
+
+    total  = len(df)
+    tol_pp = ACTION_PLAN_TOLERANCE * 100
+    misses = []
+    print_step(f"  Action plan distribution check (target ±{tol_pp:g} pts):")
+    for plan, target in ACTION_PLAN_TARGET_DISTRIBUTION.items():
+        n      = int(plans.eq(plan.upper()).sum())
+        actual = n / total
+        ok     = abs(actual - target) <= ACTION_PLAN_TOLERANCE
+        line   = (f"    {plan:<8}: {actual*100:6.2f}%  ({n:,} rows)  "
+                  f"target {target*100:.2f}%  → {'OK' if ok else 'OFF TARGET'}")
+        print(_color(line, C.GREEN if ok else C.RED))
+        if not ok:
+            misses.append(f"{plan} {actual*100:.2f}% (target {target*100:.2f}% ±{tol_pp:g})")
+
+    other = int((~plans.isin([p.upper() for p in ACTION_PLAN_TARGET_DISTRIBUTION])).sum())
+    if other:
+        print_warn(f"    {other:,} row(s) with a blank or other ACTION PLANS value "
+                   f"({other/total*100:.2f}%) — counted in the denominator.")
+
+    if not misses:
+        print_done("    Action plan distribution within tolerance.")
+        return None
+    print_warn(f"    {len(misses)} plan(s) off target — flagged '{AP_DISTRIBUTION_FLAG}' "
+               "in the rejection log.")
+    return {"misses": misses, "rows": total}
 
 
 # ── Duplicate phone numbers across owners ───────────────────────────────────────
 
+# Max distinct owners one phone number may belong to, by that number's PHONE TYPE.
+# Above the limit the row is flagged 'phone_dup_over_limit' (kept, not removed).
+PHONE_DUP_LIMIT_LANDLINE = 3   # PHONE TYPE N contains "landline"
+PHONE_DUP_LIMIT_OTHER    = 5   # every other type, including a blank type
+
+
 def _flag_duplicate_phone_numbers(df: pd.DataFrame) -> pd.DataFrame:
-    """Flag (keep) rows whose phone number is shared across MORE THAN ONE distinct
-    owner — i.e. a number that is not unique to a single owner (often a bad
-    skiptrace hit or a shared/relative line). The same number repeated across one
-    owner's multiple properties is fine. Pools every PHONE NUMBER N column,
-    normalized to digits only; numbers shorter than 7 digits are ignored as junk.
-    Flag only — nothing is removed — and the count is printed for the user."""
+    """Flag (keep) rows whose phone number is shared across distinct owners. Pools
+    every PHONE NUMBER N column, normalized to digits only; numbers shorter than 7
+    digits are ignored as junk. The same number repeated across one owner's multiple
+    properties is fine — only DISTINCT owners (OWNER FULL NAME) are counted.
+
+      • 'duplicate_phone_number' — the number belongs to more than one owner.
+      • 'phone_dup_over_limit'   — the number belongs to more owners than its type
+        allows: PHONE_DUP_LIMIT_LANDLINE for a landline, PHONE_DUP_LIMIT_OTHER for
+        any other type. The type is read from the PHONE TYPE column paired with
+        that number (PHONE NUMBER 4 ↔ PHONE TYPE 4), per row.
+
+    Flag only — nothing is removed — and the counts are printed for the user."""
     num_cols = sorted(
         [c for c in df.columns if re.match(r"PHONE NUMBER\s*\d+", c, re.IGNORECASE)],
         key=lambda x: int(re.search(r"\d+", x).group()),
@@ -1050,35 +1316,58 @@ def _flag_duplicate_phone_numbers(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     owner = df["OWNER FULL NAME"].astype(str).str.strip().str.upper()
+    type_col_by_n = {
+        int(re.search(r"\d+", c).group()): c
+        for c in df.columns if re.match(r"PHONE TYPE\s*\d+", c, re.IGNORECASE)
+    }
 
-    # Long form: one (row index, owner, phone-digits) per non-empty phone cell.
+    # Long form: one (row index, owner, phone-digits, paired phone type) per phone cell.
     frames = []
     for col in num_cols:
-        digits = df[col].astype(str).str.replace(r"\D+", "", regex=True)
+        digits   = df[col].astype(str).str.replace(r"\D+", "", regex=True)
+        type_col = type_col_by_n.get(int(re.search(r"\d+", col).group()))
+        ptype    = (df[type_col].fillna("").astype(str).str.strip()
+                    if type_col else pd.Series("", index=df.index))
         frames.append(pd.DataFrame({"idx": df.index, "owner": owner.values,
-                                    "phone": digits.values}))
+                                    "phone": digits.values, "ptype": ptype.values}))
     long = pd.concat(frames, ignore_index=True)
     long = long[long["phone"].str.len() >= 7]
     if long.empty:
         return df
 
-    # A phone is "not unique to an owner" when it maps to >1 distinct owner.
-    owners_per_phone = long.groupby("phone")["owner"].nunique()
-    shared_phones    = set(owners_per_phone[owners_per_phone > 1].index)
+    # Distinct owners per number, broadcast back to every cell holding that number.
+    long["owners"] = long.groupby("phone")["owner"].transform("nunique")
+    long["limit"]  = PHONE_DUP_LIMIT_OTHER
+    long.loc[long["ptype"].str.contains("landline", case=False, na=False), "limit"] = PHONE_DUP_LIMIT_LANDLINE
+
+    shared = long[long["owners"] > 1]
+    over   = long[long["owners"] > long["limit"]]
 
     print_step("  Duplicate phone number check:")
-    if not shared_phones:
+    if shared.empty:
         print_done("    No phone numbers shared across owners.")
         return df
 
-    rows_with_shared = set(long.loc[long["phone"].isin(shared_phones), "idx"])
-    mask = df.index.to_series().isin(rows_with_shared)
+    mask = df.index.to_series().isin(set(shared["idx"]))
     n    = int(mask.sum())
-
     df = _add_flag(df, mask, "duplicate_phone_number")
     print_warn(f"    {n:,} propert{'y' if n == 1 else 'ies'} share a phone number with "
-               f"another owner ({len(shared_phones):,} distinct number(s)) — "
+               f"another owner ({shared['phone'].nunique():,} distinct number(s)) — "
                "flagged 'duplicate_phone_number'.")
+
+    if over.empty:
+        print_done(f"    No number exceeds its owner limit "
+                   f"(landline > {PHONE_DUP_LIMIT_LANDLINE}, other > {PHONE_DUP_LIMIT_OTHER}).")
+        return df
+
+    mask_over = df.index.to_series().isin(set(over["idx"]))
+    n_over    = int(mask_over.sum())
+    is_ll     = over["limit"] == PHONE_DUP_LIMIT_LANDLINE
+    df = _add_flag(df, mask_over, "phone_dup_over_limit")
+    print_warn(f"    {n_over:,} propert{'y' if n_over == 1 else 'ies'} carry a number over its owner "
+               f"limit — {over.loc[is_ll, 'phone'].nunique():,} landline number(s) on "
+               f">{PHONE_DUP_LIMIT_LANDLINE} owners, {over.loc[~is_ll, 'phone'].nunique():,} other "
+               f"number(s) on >{PHONE_DUP_LIMIT_OTHER} owners — flagged 'phone_dup_over_limit'.")
     return df
 
 
@@ -1526,6 +1815,9 @@ def _process_file(file: Path, output_dir: Path,
         before = len(df); _apply(_filter_empty_owner_name, df)
         print_done(f"  Empty Owner Full Name    : {before - len(df):,} removed")
 
+        before = len(df); _apply(_filter_numeric_in_name, df)
+        print_done(f"  Numeric Character in Name: {before - len(df):,} removed")
+
         before = len(df); _apply(_filter_unwanted_names, df)
         print_done(f"  Unwanted Names           : {before - len(df):,} removed")
 
@@ -1603,8 +1895,16 @@ def _process_file(file: Path, output_dir: Path,
     # ── Absentee correction (all cadences) ────────────────────────────────────
     df = _correct_absentee(df)
 
-    # ── Pre-foreclosure correction (all cadences) ──────────────────────────────
-    df = _correct_preforeclosure(df)
+    # ── Pre-foreclosure correction + rejection (all cadences) ──────────────────
+    # 0.8→1 on survivors; any other non-blank value (not 0/0.8/1) is rejected.
+    before = len(df); _apply(_correct_preforeclosure, df)
+    removed = before - len(df)
+    if removed:
+        print_done(f"  Invalid Pre-Foreclosure  : {removed:,} removed")
+
+    # ── Binary indicator columns must be 0/1 (blank allowed) — reject off-values ─
+    before = len(df); _apply(_filter_invalid_binary_values, df)
+    print_done(f"  Invalid Binary Value     : {before - len(df):,} removed")
 
     # ── Duplicate phone numbers across owners (flag only) ──────────────────────
     df = _flag_duplicate_phone_numbers(df)
@@ -1658,6 +1958,7 @@ def _process_file(file: Path, output_dir: Path,
 
     # ── Apply geographic distribution or simple trim ───────────────────────────
     if goal < cleaned_rows:
+        pre_trim_df = df
         if preserve_geo and geo_col and geo_distribution:
             df = _apply_distribution(df, geo_col, geo_distribution, goal)
             print_done(f"  Trimmed to {len(df):,} rows preserving {geo_col} distribution.")
@@ -1667,6 +1968,13 @@ def _process_file(file: Path, output_dir: Path,
         else:
             df = df.head(goal)
             print_done(f"  Trimmed to {goal:,} rows keeping highest scores.")
+        _print_trim_by_action_plan(pre_trim_df, df)
+
+    # ── Action plan distribution (post-trim; flag only) ─────────────────────────
+    ap_result = _check_action_plan_distribution(df)
+    if ap_result is not None:
+        ap_result["file"]            = file.name
+        ap_result["total_file_rows"] = original_rows
 
     # ── County coverage check (mandatory) ──────────────────────────────────────
     county_result = None
@@ -1735,6 +2043,7 @@ def _process_file(file: Path, output_dir: Path,
         "county":   county_result,
         "formulas": formula_cols,
         "hidden":   hidden_cols,
+        "ap_dist":  ap_result,
     }
 
 
@@ -1745,7 +2054,8 @@ def _save_reports(rejected_all: list[pd.DataFrame],
                   output_dir:   Path,
                   county_all:   list | None = None,
                   formula_all:  list | None = None,
-                  hidden_all:   list | None = None):
+                  hidden_all:   list | None = None,
+                  ap_all:       list | None = None):
 
     frames = []
 
@@ -1879,6 +2189,17 @@ def _save_reports(rejected_all: list[pd.DataFrame],
         if hidden_rows:
             summary_frames.append(pd.DataFrame(hidden_rows))
 
+    # ── Action plan distribution off target → summary rows ─────────────────────
+    # One row per file that missed the targets. Count = number of plans off target.
+    if ap_all:
+        summary_frames.append(pd.DataFrame([{
+            "Source_File":     ap.get("file"),
+            "Total_File_Rows": ap.get("total_file_rows"),
+            "Status":          "Flagged",
+            "Stage_or_Flag":   AP_DISTRIBUTION_FLAG,
+            "Count":           len(ap["misses"]),
+        } for ap in ap_all]))
+
     if summary_frames:
         summary = pd.concat(summary_frames, ignore_index=True)
         summary["Run_Timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1924,6 +2245,17 @@ def _save_reports(rejected_all: list[pd.DataFrame],
             all_flagged["Rejection_Stage"] = all_flagged["data_quality_flags"]
             all_flagged["Rejection_Value"] = all_flagged["data_quality_flags"]
             log_frames.append(all_flagged)
+
+    # File-level row (no owner/property columns): one per file off target, with each
+    # off-target plan's actual vs target share in Rejection_Value.
+    if ap_all:
+        log_frames.append(pd.DataFrame([{
+            "Status":          "Flagged",
+            "Source_File":     ap.get("file"),
+            "Total_File_Rows": ap.get("total_file_rows"),
+            "Rejection_Stage": AP_DISTRIBUTION_FLAG,
+            "Rejection_Value": "; ".join(ap["misses"]),
+        } for ap in ap_all]))
 
     if log_frames:
         run_log_path = output_dir / "Rejection_Run_Log.xlsx"
@@ -2015,8 +2347,9 @@ def run():
              "total_file_rows": r.get("original")}
             for r in results if r.get("hidden")
         ]
+        ap_all = [r.get("ap_dist") for r in results if r.get("ap_dist")]
         _save_reports(rejected_all, flagged_all, OUT_STEP1,
-                      county_all, formula_all, hidden_all)
+                      county_all, formula_all, hidden_all, ap_all)
 
     # ── Final summary by channel ───────────────────────────────────────────────
     by_cadence: dict = defaultdict(lambda: {"in": 0, "cleaned": 0, "rejected": 0})
